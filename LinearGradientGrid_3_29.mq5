@@ -49,6 +49,11 @@
 //v3.28: Stop volume = volume of the next order in the array (respects J)
 //v3.28: HEDGE closes oldest position | NETTING reduces consolidated position
 //v3.29: COOLDOWN - Pause after stop loss with exponential backoff (30 -> 60 -> 120 -> deactivate)
+//v3.29 (revised): MAX INVENTORY - Replaced pending Stop with MARKET ORDER with hysteresis
+//                 - When positions > limit: sends opposite market order to return to the limit
+//                 - Hysteresis: volume = k * volumeMin + volume of next grid order
+//                 - HEDGE: closes k oldest positions + buffer market order of v_next
+//                 - Fixes SYMBOL_TRADE_STOPS_LEVEL rejection and guarantees a hard ceiling
 
 
 #property copyright    "Copyright 2025-2026, Trading Expert"
@@ -190,9 +195,6 @@ datetime lastProfitLossReset = 0;
 datetime lastSync               = 0;
 bool     inDisconnection        = false;
 datetime disconnectionTimestamp = 0;  // v3.23: Exact disconnection moment
-
-// v3.28: Maximum Inventory control
-ulong stopOrderTicket = 0;  // Ticket of active stop order (0 = none)
 
 // v3.22: Break Even and dynamic Trailing Loss control
 double dynamicLoss         = 0;     // Current dynamic loss (starts = MaxLoss)
@@ -910,8 +912,6 @@ void CancelAllEAOrders()
       }
    }
 
-   // v3.28: Reset stop order ticket
-   stopOrderTicket = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1007,56 +1007,32 @@ ulong GetOldestPosition()
 }
 
 //+------------------------------------------------------------------+
-//| v3.28: Cancel active Stop order (if any)                         |
+//| v3.29 (revised): Enforce Max Inventory via market order          |
+//| - When positions > MaxInventory, sends an opposite market order   |
+//|   with volume = k * volumeMin + nextGridOrderVolume (hysteresis)  |
+//| - HEDGE: closes the k oldest positions + buffer market order     |
+//| - NETTING: reduces the consolidated position                     |
 //+------------------------------------------------------------------+
-void CancelStopOrder()
-{
-   if(stopOrderTicket > 0)
-   {
-      if(OrderSelect(stopOrderTicket))
-      {
-         trade.OrderDelete(stopOrderTicket);
-
-         if(DebugMode)
-            Print("STOP order #", stopOrderTicket, " cancelled");
-      }
-
-      stopOrderTicket = 0;
-   }
-}
-
-//+------------------------------------------------------------------+
-//| v3.28: Insert protective Stop order (Max Inventory)              |
-//| - Computes midpoint between last executed and next pending       |
-//| - Volume = volume of next array order                            |
-//| - HEDGE: closes oldest position | NETTING: reduces consolidated  |
-//+------------------------------------------------------------------+
-void InsertStopOrder(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedType)
+void EnforceMaxInventory(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedType)
 {
    if(MaxInventory <= 0)
       return;
 
    int positions = CountOpenPositions();
 
-   if(positions < MaxInventory)
-   {
-      // Below the limit - cancel stop if any
-      CancelStopOrder();
-      return;
-   }
+   if(positions <= MaxInventory)
+      return;  // within the limit - nothing to do
 
-   //===== IDENTIFY the next pending order in the array =====
-   // If last executed was BUY (market falling): next pending is the LARGEST remaining BUY
-   // If last executed was SELL (market rising): next pending is the SMALLEST remaining SELL
+   int k = positions - MaxInventory;  // excess in "positions"
 
-   int nextIndex = -1;
+   //===== IDENTIFY next pending order on the accumulating side (hysteresis) =====
+   double nextVolume = 0.0;
 
    if(lastExecutedType == ORDER_TYPE_BUY_LIMIT)
    {
-      // Market falling - next BUY LIMIT is the one with HIGHEST price (closest to market)
-      // that has not yet been executed (ticket == 0 or still in book)
+      // Accumulating long: next BUY LIMIT is the HIGHEST price below last executed
       double maxPrice = 0;
-
+      int nextIndex   = -1;
       for(int i = 0; i < ArraySize(originalOrders); i++)
       {
          if(originalOrders[i].orderType == ORDER_TYPE_BUY_LIMIT &&
@@ -1069,12 +1045,14 @@ void InsertStopOrder(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedType)
             }
          }
       }
+      if(nextIndex >= 0)
+         nextVolume = originalOrders[nextIndex].volume;
    }
    else if(lastExecutedType == ORDER_TYPE_SELL_LIMIT)
    {
-      // Market rising - next SELL LIMIT is the one with LOWEST price (closest to market)
+      // Accumulating short: next SELL LIMIT is the LOWEST price above last executed
       double minPrice = DBL_MAX;
-
+      int nextIndex   = -1;
       for(int i = 0; i < ArraySize(originalOrders); i++)
       {
          if(originalOrders[i].orderType == ORDER_TYPE_SELL_LIMIT &&
@@ -1087,68 +1065,125 @@ void InsertStopOrder(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedType)
             }
          }
       }
+      if(nextIndex >= 0)
+         nextVolume = originalOrders[nextIndex].volume;
    }
-
-   // If no next order found, do not insert stop (grid exhausted)
-   if(nextIndex < 0)
+   else
    {
-      Print("========================================");
-      Print("MAX INVENTORY: No more orders in the grid!");
-      Print("Cannot insert Stop order.");
-      Print("========================================");
-      CancelStopOrder();
-      return;
+      return;  // unknown type
    }
 
-   //===== COMPUTE Stop price (midpoint) =====
-   double nextPrice = originalOrders[nextIndex].originalPrice;
-   double stopPrice = RoundPrice((lastExecutedPrice + nextPrice) / 2.0);
-
-   //===== COMPUTE Stop volume = volume of next order =====
-   double stopVolume = RoundVolume(originalOrders[nextIndex].volume);
-
-   //===== DETERMINE Stop type =====
-   ENUM_ORDER_TYPE stopType;
-
+   //===== DETERMINE market order direction (opposite of accumulating side) =====
+   ENUM_ORDER_TYPE marketType;
+   string side;
    if(lastExecutedType == ORDER_TYPE_BUY_LIMIT)
    {
-      // Accumulating BUYs (long) -> SELL STOP to reduce
-      stopType = ORDER_TYPE_SELL_STOP;
+      marketType = ORDER_TYPE_SELL;  // accumulating long -> sell
+      side       = "SELL";
    }
    else
    {
-      // Accumulating SELLs (short) -> BUY STOP to reduce
-      stopType = ORDER_TYPE_BUY_STOP;
+      marketType = ORDER_TYPE_BUY;   // accumulating short -> buy
+      side       = "BUY";
    }
 
-   //===== CANCEL previous stop if any =====
-   CancelStopOrder();
-   Sleep(100);
+   string comment = StringFormat("MaxInv:%d", MaxInventory);
+   trade.SetExpertMagicNumber(MagicNumber);
 
-   //===== CREATE Stop order =====
-   trade.SetTypeFilling(ORDER_FILLING_RETURN);
-
-   string comment = StringFormat("StopProtection:%d", MaxInventory);
-
-   if(trade.OrderOpen(_Symbol, stopType, stopVolume, 0,
-                      stopPrice, 0, 0, ORDER_TIME_GTC, 0, comment))
+   if(isHedge)
    {
-      stopOrderTicket = trade.ResultOrder();
-
+      //===== HEDGE: close the k oldest positions (one by one) =====
       Print("========================================");
-      Print("MAX INVENTORY REACHED! Protective Stop inserted!");
-      Print("Open positions: ", positions, " / Max: ", MaxInventory);
-      Print("Type: ", EnumToString(stopType));
-      Print("Price: ", DoubleToString(stopPrice, _Digits), " (midpoint)");
-      Print("  Last executed: ", DoubleToString(lastExecutedPrice, _Digits));
-      Print("  Next pending: ", DoubleToString(nextPrice, _Digits));
-      Print("Volume: ", DoubleToString(stopVolume, 2), " (= next grid order)");
-      Print("Ticket: #", stopOrderTicket);
+      Print("MAX INVENTORY EXCEEDED! Enforcing limit (HEDGE)");
+      Print("Open positions: ", positions, " / Max: ", MaxInventory, " (excess k = ", k, ")");
+      Print("Volume of next grid order: ", DoubleToString(nextVolume, 2));
+      Print("Closing side: ", side);
+      Print("Strategy: close k=", k, " oldest positions",
+            (nextVolume > 0 ? StringFormat(" + market order of %s lots (hysteresis)", DoubleToString(nextVolume, 2)) : ""));
+
+      int closed = 0;
+      for(int step = 0; step < k && step < 1000; step++)
+      {
+         ulong oldestTicket = GetOldestPosition();
+         if(oldestTicket == 0)
+            break;
+
+         if(trade.PositionClose(oldestTicket))
+         {
+            closed++;
+            if(DebugMode)
+               Print("  Position #", oldestTicket, " closed (", closed, "/", k, ")");
+         }
+         else
+         {
+            Print("Error closing position #", oldestTicket, ": ",
+                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+            break;
+         }
+         Sleep(50);
+      }
+
+      // Hysteresis buffer: extra market order with volume of next grid order
+      if(nextVolume > 0)
+      {
+         double bufferVolume = RoundVolume(nextVolume);
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+         bool ok = false;
+         if(marketType == ORDER_TYPE_SELL)
+            ok = trade.Sell(bufferVolume, _Symbol, bid, 0, 0, comment);
+         else
+            ok = trade.Buy(bufferVolume, _Symbol, ask, 0, 0, comment);
+
+         if(ok)
+            Print("Hysteresis buffer (HEDGE): ", side, " market order of ",
+                  DoubleToString(bufferVolume, 2), " lots sent");
+         else
+            Print("Error sending hysteresis buffer: ",
+                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+      }
+
+      Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
       Print("========================================");
    }
    else
    {
-      Print("Error creating STOP order: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+      //===== NETTING: single opposite market order =====
+      double volumeMin   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double totalVolume = RoundVolume(k * volumeMin + nextVolume);
+
+      if(totalVolume <= 0)
+         return;
+
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      Print("========================================");
+      Print("MAX INVENTORY EXCEEDED! Enforcing limit (NETTING)");
+      Print("Open positions: ", positions, " / Max: ", MaxInventory, " (excess k = ", k, ")");
+      Print("Volume of next grid order: ", DoubleToString(nextVolume, 2));
+      Print("Market volume: ", DoubleToString(totalVolume, 2),
+            " (= k*", DoubleToString(volumeMin, 2), " + v_next)");
+      Print("Side: ", side);
+
+      bool ok = false;
+      if(marketType == ORDER_TYPE_SELL)
+         ok = trade.Sell(totalVolume, _Symbol, bid, 0, 0, comment);
+      else
+         ok = trade.Buy(totalVolume, _Symbol, ask, 0, 0, comment);
+
+      if(ok)
+      {
+         Print("Market order sent. Ticket: #", trade.ResultOrder());
+         Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
+      }
+      else
+      {
+         Print("Error sending market order: ",
+               trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+      }
+      Print("========================================");
    }
 }
 
@@ -2608,8 +2643,8 @@ int OnInit()
       Print("============================================");
       Print("Max Inventory ENABLED");
       Print("Limit: ", MaxInventory, " positions");
-      Print("Protective stop: midpoint (last exec <-> next pending)");
-      Print("Mode: ", isHedge ? "HEDGE (closes oldest)" : "NETTING (reduces consolidated)");
+      Print("Protection: opposite market order with hysteresis (k + v_next of grid)");
+      Print("Mode: ", isHedge ? "HEDGE (closes oldest positions)" : "NETTING (reduces consolidated)");
       Print("============================================");
    }
 
@@ -2688,7 +2723,7 @@ int OnInit()
       Print("============================================");
       Print("Linear Gradient Grid v3.29 initialized!");
       Print("v3.29: Cooldown with backoff after stop loss");
-      Print("v3.28: Max inventory with protective Stop");
+      Print("v3.29 (revised): Max Inventory via market order with hysteresis");
       Print("v3.26: Tick size rounding (fixes J/K)");
       Print("v3.20: Fix P/L label (MT5 update)");
       Print("v3.18: Active cancellation verification");
@@ -2885,35 +2920,15 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       Print("========================================");
    }
 
-   //===== v3.28: CHECK IF IT IS A PROTECTIVE STOP ORDER =====
-   if(orderTicket == stopOrderTicket && stopOrderTicket > 0)
+   //===== v3.29 (revised): SKIP deals from Max Inventory enforcement =====
+   // Orders sent by EnforceMaxInventory() carry the comment "MaxInv:<N>".
+   // Those deals must not trigger gain orders nor re-enter the grid flow.
+   string dealComment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+   if(StringFind(dealComment, "MaxInv:") == 0)
    {
-      Print("========================================");
-      Print("PROTECTIVE STOP ORDER EXECUTED!");
-      Print("Ticket: #", orderTicket);
-      Print("Type: ", EnumToString(dealType));
-      Print("Volume: ", DoubleToString(dealVolume, 2));
-
-      if(isHedge)
-      {
-         // HEDGE: Close oldest position to free capital
-         ulong oldestPositionTicket = GetOldestPosition();
-         if(oldestPositionTicket > 0)
-         {
-            // The stop order already executed, creating a new opposite position
-            // Now we need to close the oldest position
-            // Actually, the SELL STOP already sold, reducing exposure
-            Print("Oldest position in market: #", oldestPositionTicket);
-         }
-      }
-
-      Print("Capital freed for next grid operation");
-      Print("========================================");
-
-      // Clear ticket - stop has been consumed
-      stopOrderTicket = 0;
-
-      return;  // Do not process as grid order
+      if(DebugMode)
+         Print("Max-inventory enforcement deal (MaxInv) skipped by grid flow.");
+      return;
    }
 
    //===== SEARCH order in array by TICKET =====
@@ -3034,7 +3049,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    else
       executedOrderType = ORDER_TYPE_SELL_LIMIT;
 
-   InsertStopOrder(originalPrice, executedOrderType);
+   EnforceMaxInventory(originalPrice, executedOrderType);
 
    //===== SAVE state =====
    SaveGridState();
