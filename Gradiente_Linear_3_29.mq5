@@ -53,6 +53,8 @@
 //                  - Quando posições > limite: envia ordem oposta a mercado para retornar ao limite
 //                  - Histerese: volume = k * volumeMin + volume da próxima ordem da grade
 //                  - HEDGE: fecha k posições mais antigas + buffer a mercado de v_próxima
+//                  - Ordem a mercado é disparada ANTES de InserirOrdensExtremas para evitar
+//                    cancelamento por self-match contra pendentes do próprio EA na B3
 //                  - Resolve rejeição por SYMBOL_TRADE_STOPS_LEVEL e garante teto absoluto
 
 
@@ -3030,11 +3032,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          Print("✅ Ordem original removida do array");
    }
    
-   // ===== 🔄 ATUALIZAR as 2 extremas no MT5 =====
-   InserirOrdensExtremas();
-
-   // ===== 🛡️ v3.28: VERIFICAR ESTOQUE MÁXIMO =====
-   // Determinar tipo da ordem que foi executada para saber direção do mercado
+   // ===== 🛡️ v3.29 (revisado): APLICAR ESTOQUE MÁXIMO ANTES DAS EXTREMAS =====
+   // Importante: a ordem a mercado precisa sair SEM pendentes nossas no book,
+   // senão o broker (B3) cancela por self-match (auto-execução).
    ENUM_ORDER_TYPE tipoOrdemExecutada;
    if(dealType == DEAL_TYPE_BUY)
       tipoOrdemExecutada = ORDER_TYPE_BUY_LIMIT;
@@ -3042,6 +3042,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       tipoOrdemExecutada = ORDER_TYPE_SELL_LIMIT;
 
    AplicarEstoqueMaximo(precoOriginal, tipoOrdemExecutada);
+
+   // ===== 🔄 ATUALIZAR as 2 extremas no MT5 =====
+   InserirOrdensExtremas();
 
    // ===== 💾 SALVAR estado =====
    SalvarEstadoGrade();

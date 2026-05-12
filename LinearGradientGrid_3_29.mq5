@@ -53,6 +53,8 @@
 //                 - When positions > limit: sends opposite market order to return to the limit
 //                 - Hysteresis: volume = k * volumeMin + volume of next grid order
 //                 - HEDGE: closes k oldest positions + buffer market order of v_next
+//                 - Market order is fired BEFORE InsertExtremeOrders to avoid B3 self-trade
+//                   cancellation against the EA's own pendings in the book
 //                 - Fixes SYMBOL_TRADE_STOPS_LEVEL rejection and guarantees a hard ceiling
 
 
@@ -3038,11 +3040,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          Print("Original order removed from array");
    }
 
-   //===== UPDATE the 2 extremes in MT5 =====
-   InsertExtremeOrders();
-
-   //===== v3.28: CHECK MAX INVENTORY =====
-   // Determine type of the executed order to know market direction
+   //===== v3.29 (revised): ENFORCE MAX INVENTORY BEFORE EXTREMES =====
+   // Important: the market order must be sent with NO pendings of ours in the book,
+   // otherwise the broker (B3) cancels it due to self-trade prevention.
    ENUM_ORDER_TYPE executedOrderType;
    if(dealType == DEAL_TYPE_BUY)
       executedOrderType = ORDER_TYPE_BUY_LIMIT;
@@ -3050,6 +3050,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       executedOrderType = ORDER_TYPE_SELL_LIMIT;
 
    EnforceMaxInventory(originalPrice, executedOrderType);
+
+   //===== UPDATE the 2 extremes in MT5 =====
+   InsertExtremeOrders();
 
    //===== SAVE state =====
    SaveGridState();
