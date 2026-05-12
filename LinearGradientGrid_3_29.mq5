@@ -50,11 +50,14 @@
 //v3.28: HEDGE closes oldest position | NETTING reduces consolidated position
 //v3.29: COOLDOWN - Pause after stop loss with exponential backoff (30 -> 60 -> 120 -> deactivate)
 //v3.29 (revised): MAX INVENTORY - Replaced pending Stop with MARKET ORDER with hysteresis
-//                 - When positions > limit: sends opposite market order to return to the limit
-//                 - Hysteresis: volume = k * volumeMin + volume of next grid order
-//                 - HEDGE: closes k oldest positions + buffer market order of v_next
-//                 - Market order is fired BEFORE InsertExtremeOrders to avoid B3 self-trade
-//                   cancellation against the EA's own pendings in the book
+//                 - MaxInventory is a VOLUME LIMIT (shares, contracts) in the same unit as
+//                   the grid order volumes (NOT a position count)
+//                 - When current_volume > MaxInventory: sends opposite market order with
+//                   volume = k + v_next (k = current_volume - MaxInventory)
+//                 - HEDGE: closes oldest positions (full or partial) until covering k + v_next
+//                 - NETTING: single opposite market order of k + v_next
+//                 - Fired BEFORE InsertExtremeOrders to avoid B3 self-trade cancellation
+//                   against the EA's own pendings in the book
 //                 - Fixes SYMBOL_TRADE_STOPS_LEVEL rejection and guarantees a hard ceiling
 
 
@@ -1009,23 +1012,58 @@ ulong GetOldestPosition()
 }
 
 //+------------------------------------------------------------------+
+//| v3.29 (revised): Get total position volume                       |
+//| - HEDGE: sum volume of all positions filtered by MagicNumber      |
+//| - NETTING: volume of the consolidated position for the symbol    |
+//+------------------------------------------------------------------+
+double GetTotalPositionVolume()
+{
+   double total = 0.0;
+
+   if(isHedge)
+   {
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0 &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            total += PositionGetDouble(POSITION_VOLUME);
+         }
+      }
+   }
+   else
+   {
+      if(PositionSelect(_Symbol))
+         total = PositionGetDouble(POSITION_VOLUME);
+   }
+
+   return total;
+}
+
+//+------------------------------------------------------------------+
 //| v3.29 (revised): Enforce Max Inventory via market order          |
-//| - When positions > MaxInventory, sends an opposite market order   |
-//|   with volume = k * volumeMin + nextGridOrderVolume (hysteresis)  |
-//| - HEDGE: closes the k oldest positions + buffer market order     |
-//| - NETTING: reduces the consolidated position                     |
+//| - MaxInventory is treated as a VOLUME LIMIT (shares, contracts), |
+//|   in the same unit as grid order volumes (NOT a position count). |
+//| - When current_volume > MaxInventory:                             |
+//|     k = current_volume - MaxInventory  (excess in real volume)    |
+//|     market_volume = k + v_next  (hysteresis)                      |
+//| - HEDGE: closes oldest positions (full or partial) until covering |
+//|   k + v_next                                                      |
+//| - NETTING: single opposite market order of k + v_next            |
 //+------------------------------------------------------------------+
 void EnforceMaxInventory(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedType)
 {
    if(MaxInventory <= 0)
       return;
 
-   int positions = CountOpenPositions();
+   double currentVolume = GetTotalPositionVolume();
 
-   if(positions <= MaxInventory)
+   if(currentVolume <= MaxInventory)
       return;  // within the limit - nothing to do
 
-   int k = positions - MaxInventory;  // excess in "positions"
+   double k = currentVolume - MaxInventory;  // excess in REAL asset volume
 
    //===== IDENTIFY next pending order on the accumulating side (hysteresis) =====
    double nextVolume = 0.0;
@@ -1092,81 +1130,82 @@ void EnforceMaxInventory(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedT
    string comment = StringFormat("MaxInv:%d", MaxInventory);
    trade.SetExpertMagicNumber(MagicNumber);
 
+   double totalVolume = RoundVolume(k + nextVolume);
+   if(totalVolume <= 0)
+      return;
+
    if(isHedge)
    {
-      //===== HEDGE: close the k oldest positions (one by one) =====
+      //===== HEDGE: close oldest positions until covering k + v_next =====
       Print("========================================");
       Print("MAX INVENTORY EXCEEDED! Enforcing limit (HEDGE)");
-      Print("Open positions: ", positions, " / Max: ", MaxInventory, " (excess k = ", k, ")");
+      Print("Current volume: ", DoubleToString(currentVolume, 2),
+            " / Max: ", MaxInventory,
+            " (excess k = ", DoubleToString(k, 2), ")");
       Print("Volume of next grid order: ", DoubleToString(nextVolume, 2));
+      Print("Total volume to close: ", DoubleToString(totalVolume, 2),
+            " (= k + v_next)");
       Print("Closing side: ", side);
-      Print("Strategy: close k=", k, " oldest positions",
-            (nextVolume > 0 ? StringFormat(" + market order of %s lots (hysteresis)", DoubleToString(nextVolume, 2)) : ""));
 
-      int closed = 0;
-      for(int step = 0; step < k && step < 1000; step++)
+      double closed = 0.0;
+      int steps = 0;
+      while(closed < totalVolume && steps < 1000)
       {
+         steps++;
          ulong oldestTicket = GetOldestPosition();
          if(oldestTicket == 0)
             break;
+         if(!PositionSelectByTicket(oldestTicket))
+            break;
+         double posVolume = PositionGetDouble(POSITION_VOLUME);
+         double remaining = totalVolume - closed;
 
-         if(trade.PositionClose(oldestTicket))
+         bool ok = false;
+         if(posVolume <= remaining + 1e-9)
          {
-            closed++;
-            if(DebugMode)
-               Print("  Position #", oldestTicket, " closed (", closed, "/", k, ")");
+            // Close entire position
+            ok = trade.PositionClose(oldestTicket);
+            if(ok) closed += posVolume;
          }
          else
          {
-            Print("Error closing position #", oldestTicket, ": ",
+            // Partial close to cover only the remaining amount
+            double partialVolume = RoundVolume(remaining);
+            if(partialVolume <= 0) break;
+            ok = trade.PositionClosePartial(oldestTicket, partialVolume);
+            if(ok) closed += partialVolume;
+         }
+
+         if(!ok)
+         {
+            Print("Error closing #", oldestTicket, ": ",
                   trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
             break;
          }
+         if(DebugMode)
+            Print("  Cumulative closed: ", DoubleToString(closed, 2),
+                  " / target: ", DoubleToString(totalVolume, 2));
          Sleep(50);
       }
 
-      // Hysteresis buffer: extra market order with volume of next grid order
-      if(nextVolume > 0)
-      {
-         double bufferVolume = RoundVolume(nextVolume);
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-         bool ok = false;
-         if(marketType == ORDER_TYPE_SELL)
-            ok = trade.Sell(bufferVolume, _Symbol, bid, 0, 0, comment);
-         else
-            ok = trade.Buy(bufferVolume, _Symbol, ask, 0, 0, comment);
-
-         if(ok)
-            Print("Hysteresis buffer (HEDGE): ", side, " market order of ",
-                  DoubleToString(bufferVolume, 2), " lots sent");
-         else
-            Print("Error sending hysteresis buffer: ",
-                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
-
-      Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
+      Print("Volume now: ", DoubleToString(GetTotalPositionVolume(), 2),
+            " / Max: ", MaxInventory);
       Print("========================================");
    }
    else
    {
-      //===== NETTING: single opposite market order =====
-      double volumeMin   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      double totalVolume = RoundVolume(k * volumeMin + nextVolume);
-
-      if(totalVolume <= 0)
-         return;
-
+      //===== NETTING: single opposite market order of k + v_next =====
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
       Print("========================================");
       Print("MAX INVENTORY EXCEEDED! Enforcing limit (NETTING)");
-      Print("Open positions: ", positions, " / Max: ", MaxInventory, " (excess k = ", k, ")");
+      Print("Current volume: ", DoubleToString(currentVolume, 2),
+            " / Max: ", MaxInventory,
+            " (excess k = ", DoubleToString(k, 2), ")");
       Print("Volume of next grid order: ", DoubleToString(nextVolume, 2));
       Print("Market volume: ", DoubleToString(totalVolume, 2),
-            " (= k*", DoubleToString(volumeMin, 2), " + v_next)");
+            " (= k + v_next)");
       Print("Side: ", side);
 
       bool ok = false;
@@ -1178,7 +1217,8 @@ void EnforceMaxInventory(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedT
       if(ok)
       {
          Print("Market order sent. Ticket: #", trade.ResultOrder());
-         Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
+         Print("Volume now: ", DoubleToString(GetTotalPositionVolume(), 2),
+               " / Max: ", MaxInventory);
       }
       else
       {
@@ -2644,8 +2684,9 @@ int OnInit()
    {
       Print("============================================");
       Print("Max Inventory ENABLED");
-      Print("Limit: ", MaxInventory, " positions");
-      Print("Protection: opposite market order with hysteresis (k + v_next of grid)");
+      Print("Limit: ", MaxInventory, " (asset real volume)");
+      Print("Protection: opposite market order with hysteresis (k + v_next)");
+      Print("  k = current_volume - MaxInventory (excess in real volume)");
       Print("Mode: ", isHedge ? "HEDGE (closes oldest positions)" : "NETTING (reduces consolidated)");
       Print("============================================");
    }

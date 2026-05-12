@@ -50,11 +50,14 @@
 //v3.28: HEDGE fecha posição mais antiga | NETTING reduz posição consolidada
 //v3.29: COOLDOWN - Pausa após stop loss com backoff exponencial (30→60→120→desativa)
 //v3.29 (revisado): ESTOQUE MÁXIMO - Trocado Stop pendente por ORDEM A MERCADO com histerese
-//                  - Quando posições > limite: envia ordem oposta a mercado para retornar ao limite
-//                  - Histerese: volume = k * volumeMin + volume da próxima ordem da grade
-//                  - HEDGE: fecha k posições mais antigas + buffer a mercado de v_próxima
-//                  - Ordem a mercado é disparada ANTES de InserirOrdensExtremas para evitar
-//                    cancelamento por self-match contra pendentes do próprio EA na B3
+//                  - EstoqueMaximo é LIMITE DE VOLUME do ativo (ações, contratos),
+//                    na mesma unidade dos volumes das ordens (não é contagem de posições)
+//                  - Quando volume_atual > EstoqueMaximo: envia ordem oposta a mercado
+//                    com volume = k + v_próxima (k = volume_atual - EstoqueMaximo)
+//                  - HEDGE: fecha posições mais antigas (full ou partial) até cobrir k + v_próxima
+//                  - NETTING: única ordem a mercado oposta de k + v_próxima
+//                  - Disparada ANTES de InserirOrdensExtremas para evitar cancelamento por
+//                    self-match contra pendentes do próprio EA na B3
 //                  - Resolve rejeição por SYMBOL_TRADE_STOPS_LEVEL e garante teto absoluto
 
 
@@ -1002,23 +1005,58 @@ ulong ObterPosicaoMaisAntiga()
 }
 
 //+------------------------------------------------------------------+
+//| ✅ v3.29 (revisado): Obter volume total das posições do EA       |
+//| - HEDGE: soma volume de todas as posições com nosso MagicNumber   |
+//| - NETTING: volume da posição consolidada do símbolo              |
+//+------------------------------------------------------------------+
+double ObterVolumeTotalPosicoes()
+{
+   double total = 0.0;
+
+   if(isHedge)
+   {
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0 &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            total += PositionGetDouble(POSITION_VOLUME);
+         }
+      }
+   }
+   else
+   {
+      if(PositionSelect(_Symbol))
+         total = PositionGetDouble(POSITION_VOLUME);
+   }
+
+   return total;
+}
+
+//+------------------------------------------------------------------+
 //| ✅ v3.29 (revisado): Aplicar Estoque Máximo via ordem a mercado  |
-//| - Quando posições > EstoqueMaximo, envia ordem a mercado oposta   |
-//|   com volume = k * volumeMin + volumeProximaOrdem (histerese)     |
-//| - HEDGE: fecha as k posições mais antigas (sem somar v_next)      |
-//| - NETTING: reduz a posição consolidada                             |
+//| - EstoqueMaximo é tratado como LIMITE DE VOLUME do ativo          |
+//|   (ações, contratos), na mesma unidade dos volumes das ordens    |
+//| - Quando volume_atual > EstoqueMaximo:                            |
+//|     k = volume_atual - EstoqueMaximo  (excedente em volume real)  |
+//|     volume_a_mercado = k + v_próxima  (histerese)                 |
+//| - HEDGE: fecha posições mais antigas (full ou partial) até cobrir |
+//|   k + v_próxima                                                   |
+//| - NETTING: única ordem a mercado oposta de k + v_próxima         |
 //+------------------------------------------------------------------+
 void AplicarEstoqueMaximo(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltimaExecutada)
 {
    if(EstoqueMaximo <= 0)
       return;
 
-   int posicoes = ContarPosicoesAbertas();
+   double volumeAtual = ObterVolumeTotalPosicoes();
 
-   if(posicoes <= EstoqueMaximo)
+   if(volumeAtual <= EstoqueMaximo)
       return;  // Dentro do limite - nada a fazer
 
-   int k = posicoes - EstoqueMaximo;  // excesso em "posições"
+   double k = volumeAtual - EstoqueMaximo;  // excedente em VOLUME real do ativo
 
    // ===== IDENTIFICAR próxima ordem pendente do lado acumulador (histerese) =====
    double volumeProxima = 0.0;
@@ -1085,81 +1123,82 @@ void AplicarEstoqueMaximo(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltim
    string comentario = StringFormat("MaxInv:%d", EstoqueMaximo);
    trade.SetExpertMagicNumber(MagicNumber);
 
+   double volTotal = ArredondarVolume(k + volumeProxima);
+   if(volTotal <= 0)
+      return;
+
    if(isHedge)
    {
-      // ===== HEDGE: fechar as k posições mais antigas (uma a uma) =====
+      // ===== HEDGE: fechar posições mais antigas até cobrir k + v_próxima =====
       Print("========================================");
       Print("🛡️ ESTOQUE MÁXIMO EXCEDIDO! Aplicando proteção (HEDGE)");
-      Print("Posições abertas: ", posicoes, " / Máximo: ", EstoqueMaximo, " (excedente k = ", k, ")");
+      Print("Volume atual: ", DoubleToString(volumeAtual, 2),
+            " / Máximo: ", EstoqueMaximo,
+            " (excedente k = ", DoubleToString(k, 2), ")");
       Print("Volume da próxima ordem da grade: ", DoubleToString(volumeProxima, 2));
+      Print("Volume total a fechar: ", DoubleToString(volTotal, 2),
+            " (= k + v_próxima)");
       Print("Lado de fechamento: ", lado);
-      Print("Estratégia: fechar k=", k, " posições mais antigas",
-            (volumeProxima > 0 ? StringFormat(" + 1 ordem a mercado de %s lotes (histerese)", DoubleToString(volumeProxima, 2)) : ""));
 
-      int fechadas = 0;
-      for(int passo = 0; passo < k && passo < 1000; passo++)
+      double fechado = 0.0;
+      int passos = 0;
+      while(fechado < volTotal && passos < 1000)
       {
+         passos++;
          ulong ticketAntigo = ObterPosicaoMaisAntiga();
          if(ticketAntigo == 0)
             break;
+         if(!PositionSelectByTicket(ticketAntigo))
+            break;
+         double volPos = PositionGetDouble(POSITION_VOLUME);
+         double restante = volTotal - fechado;
 
-         if(trade.PositionClose(ticketAntigo))
+         bool ok = false;
+         if(volPos <= restante + 1e-9)
          {
-            fechadas++;
-            if(ModoDebug)
-               Print("  Posição #", ticketAntigo, " fechada (", fechadas, "/", k, ")");
+            // Fecha posição inteira
+            ok = trade.PositionClose(ticketAntigo);
+            if(ok) fechado += volPos;
          }
          else
          {
-            Print("❌ Erro ao fechar posição #", ticketAntigo, ": ",
+            // Fecha parcialmente apenas o restante
+            double volParcial = ArredondarVolume(restante);
+            if(volParcial <= 0) break;
+            ok = trade.PositionClosePartial(ticketAntigo, volParcial);
+            if(ok) fechado += volParcial;
+         }
+
+         if(!ok)
+         {
+            Print("❌ Erro ao fechar #", ticketAntigo, ": ",
                   trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
             break;
          }
+         if(ModoDebug)
+            Print("  Fechado acumulado: ", DoubleToString(fechado, 2),
+                  " / alvo: ", DoubleToString(volTotal, 2));
          Sleep(50);
       }
 
-      // Buffer adicional (histerese): ordem a mercado com volume da próxima da grade
-      if(volumeProxima > 0)
-      {
-         double volBuffer = ArredondarVolume(volumeProxima);
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-         bool ok = false;
-         if(tipoMercado == ORDER_TYPE_SELL)
-            ok = trade.Sell(volBuffer, _Symbol, bid, 0, 0, comentario);
-         else
-            ok = trade.Buy(volBuffer, _Symbol, ask, 0, 0, comentario);
-
-         if(ok)
-            Print("✅ Buffer de histerese (HEDGE): ", lado, " a mercado de ",
-                  DoubleToString(volBuffer, 2), " lotes enviado");
-         else
-            Print("❌ Erro no buffer de histerese: ",
-                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
-
-      Print("Posições agora: ", ContarPosicoesAbertas(), " / Máximo: ", EstoqueMaximo);
+      Print("Volume agora: ", DoubleToString(ObterVolumeTotalPosicoes(), 2),
+            " / Máximo: ", EstoqueMaximo);
       Print("========================================");
    }
    else
    {
-      // ===== NETTING: única ordem a mercado oposta =====
-      double volumeMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      double volTotal = ArredondarVolume(k * volumeMin + volumeProxima);
-
-      if(volTotal <= 0)
-         return;
-
+      // ===== NETTING: única ordem a mercado oposta de k + v_próxima =====
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
       Print("========================================");
       Print("🛡️ ESTOQUE MÁXIMO EXCEDIDO! Aplicando proteção (NETTING)");
-      Print("Posições abertas: ", posicoes, " / Máximo: ", EstoqueMaximo, " (excedente k = ", k, ")");
+      Print("Volume atual: ", DoubleToString(volumeAtual, 2),
+            " / Máximo: ", EstoqueMaximo,
+            " (excedente k = ", DoubleToString(k, 2), ")");
       Print("Volume da próxima ordem da grade: ", DoubleToString(volumeProxima, 2));
       Print("Volume a mercado: ", DoubleToString(volTotal, 2),
-            " (= k*", DoubleToString(volumeMin, 2), " + v_próxima)");
+            " (= k + v_próxima)");
       Print("Lado: ", lado);
 
       bool ok = false;
@@ -1171,7 +1210,8 @@ void AplicarEstoqueMaximo(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltim
       if(ok)
       {
          Print("✅ Ordem a mercado enviada. Ticket: #", trade.ResultOrder());
-         Print("Posições agora: ", ContarPosicoesAbertas(), " / Máximo: ", EstoqueMaximo);
+         Print("Volume agora: ", DoubleToString(ObterVolumeTotalPosicoes(), 2),
+               " / Máximo: ", EstoqueMaximo);
       }
       else
       {
@@ -2637,8 +2677,9 @@ int OnInit()
    {
       Print("============================================");
       Print("🛡️ Estoque Máximo ATIVADO");
-      Print("Limite: ", EstoqueMaximo, " posições");
-      Print("Proteção: ordem a mercado oposta com histerese (k + v_próxima da grade)");
+      Print("Limite: ", EstoqueMaximo, " (volume real do ativo)");
+      Print("Proteção: ordem a mercado oposta com histerese (k + v_próxima)");
+      Print("  k = volume_atual - EstoqueMaximo (excedente em volume real)");
       Print("Modo: ", isHedge ? "HEDGE (fecha posições mais antigas)" : "NETTING (reduz consolidada)");
       Print("============================================");
    }
