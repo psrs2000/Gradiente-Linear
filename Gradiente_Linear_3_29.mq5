@@ -1120,62 +1120,76 @@ void AplicarEstoqueMaximo(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltim
       if(volumeProxima > 0)
       {
          double volBuffer = ArredondarVolume(volumeProxima);
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
+         trade.SetTypeFillingBySymbol(_Symbol);
          bool ok = false;
          if(tipoMercado == ORDER_TYPE_SELL)
-            ok = trade.Sell(volBuffer, _Symbol, bid, 0, 0, comentario);
+            ok = trade.Sell(volBuffer, _Symbol, 0, 0, 0, comentario);
          else
-            ok = trade.Buy(volBuffer, _Symbol, ask, 0, 0, comentario);
+            ok = trade.Buy(volBuffer, _Symbol, 0, 0, 0, comentario);
 
-         if(ok)
-            Print("✅ Buffer de histerese (HEDGE): ", lado, " a mercado de ",
-                  DoubleToString(volBuffer, 2), " lotes enviado");
-         else
-            Print("❌ Erro no buffer de histerese: ",
-                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+         Print("Buffer histerese (HEDGE) ", lado, " ", DoubleToString(volBuffer, 2),
+               " lotes -> retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ")",
+               " deal=#", trade.ResultDeal(),
+               " ordem=#", trade.ResultOrder());
+
+         if(!ok)
+            Print("❌ Buffer de histerese falhou.");
       }
 
+      Sleep(200);  // dar tempo do servidor refletir as posições
       Print("Posições agora: ", ContarPosicoesAbertas(), " / Máximo: ", EstoqueMaximo);
       Print("========================================");
    }
    else
    {
-      // ===== NETTING: única ordem a mercado oposta =====
+      // ===== NETTING: reduzir posição consolidada via PositionClosePartial =====
       double volumeMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double volTotal = ArredondarVolume(k * volumeMin + volumeProxima);
 
       if(volTotal <= 0)
          return;
 
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
       Print("========================================");
       Print("🛡️ ESTOQUE MÁXIMO EXCEDIDO! Aplicando proteção (NETTING)");
       Print("Posições abertas: ", posicoes, " / Máximo: ", EstoqueMaximo, " (excedente k = ", k, ")");
       Print("Volume da próxima ordem da grade: ", DoubleToString(volumeProxima, 2));
-      Print("Volume a mercado: ", DoubleToString(volTotal, 2),
+      Print("Volume a reduzir: ", DoubleToString(volTotal, 2),
             " (= k*", DoubleToString(volumeMin, 2), " + v_próxima)");
-      Print("Lado: ", lado);
+      Print("Lado da redução: ", lado);
 
-      bool ok = false;
-      if(tipoMercado == ORDER_TYPE_SELL)
-         ok = trade.Sell(volTotal, _Symbol, bid, 0, 0, comentario);
-      else
-         ok = trade.Buy(volTotal, _Symbol, ask, 0, 0, comentario);
+      // PositionClosePartial em NETTING reduz a consolidada pela direção certa
+      trade.SetTypeFillingBySymbol(_Symbol);
+      bool ok = trade.PositionClosePartial(_Symbol, volTotal);
 
-      if(ok)
+      Print("PositionClosePartial -> retorno=", (ok ? "true" : "false"),
+            " retcode=", trade.ResultRetcode(),
+            " (", trade.ResultRetcodeDescription(), ")",
+            " deal=#", trade.ResultDeal(),
+            " ordem=#", trade.ResultOrder());
+
+      // Se PositionClosePartial não funcionou (alguns ativos B3 exigem ordem manual),
+      // tentar fallback enviando market order direto com a tag MaxInv:
+      if(!ok || trade.ResultRetcode() == TRADE_RETCODE_REJECT
+             || trade.ResultRetcode() == TRADE_RETCODE_INVALID)
       {
-         Print("✅ Ordem a mercado enviada. Ticket: #", trade.ResultOrder());
-         Print("Posições agora: ", ContarPosicoesAbertas(), " / Máximo: ", EstoqueMaximo);
+         Print("↪ Fallback: enviando ordem a mercado direta com tag MaxInv");
+
+         if(tipoMercado == ORDER_TYPE_SELL)
+            ok = trade.Sell(volTotal, _Symbol, 0, 0, 0, comentario);
+         else
+            ok = trade.Buy(volTotal, _Symbol, 0, 0, 0, comentario);
+
+         Print("Fallback -> retorno=", (ok ? "true" : "false"),
+               " retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ")",
+               " deal=#", trade.ResultDeal(),
+               " ordem=#", trade.ResultOrder());
       }
-      else
-      {
-         Print("❌ Erro ao enviar ordem a mercado: ",
-               trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
+
+      Sleep(200);  // dar tempo do servidor refletir as posições
+      Print("Posições agora: ", ContarPosicoesAbertas(), " / Máximo: ", EstoqueMaximo);
       Print("========================================");
    }
 }
@@ -2918,8 +2932,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    string dealComment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
    if(StringFind(dealComment, "MaxInv:") == 0)
    {
-      if(ModoDebug)
-         Print("🛡️ Deal de proteção (MaxInv) ignorado pelo fluxo da grade.");
+      Print("🛡️ Deal MaxInv #", dealTicket, " executado (vol=",
+            DoubleToString(dealVolume, 2), ", tipo=", EnumToString(dealType),
+            ") - ignorado pelo fluxo da grade.");
       return;
    }
 

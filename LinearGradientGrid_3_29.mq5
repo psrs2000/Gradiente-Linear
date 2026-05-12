@@ -1127,62 +1127,75 @@ void EnforceMaxInventory(double lastExecutedPrice, ENUM_ORDER_TYPE lastExecutedT
       if(nextVolume > 0)
       {
          double bufferVolume = RoundVolume(nextVolume);
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
+         trade.SetTypeFillingBySymbol(_Symbol);
          bool ok = false;
          if(marketType == ORDER_TYPE_SELL)
-            ok = trade.Sell(bufferVolume, _Symbol, bid, 0, 0, comment);
+            ok = trade.Sell(bufferVolume, _Symbol, 0, 0, 0, comment);
          else
-            ok = trade.Buy(bufferVolume, _Symbol, ask, 0, 0, comment);
+            ok = trade.Buy(bufferVolume, _Symbol, 0, 0, 0, comment);
 
-         if(ok)
-            Print("Hysteresis buffer (HEDGE): ", side, " market order of ",
-                  DoubleToString(bufferVolume, 2), " lots sent");
-         else
-            Print("Error sending hysteresis buffer: ",
-                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+         Print("Hysteresis buffer (HEDGE) ", side, " ", DoubleToString(bufferVolume, 2),
+               " lots -> retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ")",
+               " deal=#", trade.ResultDeal(),
+               " order=#", trade.ResultOrder());
+
+         if(!ok)
+            Print("Hysteresis buffer failed.");
       }
 
+      Sleep(200);  // give the server time to reflect positions
       Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
       Print("========================================");
    }
    else
    {
-      //===== NETTING: single opposite market order =====
+      //===== NETTING: reduce consolidated position via PositionClosePartial =====
       double volumeMin   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double totalVolume = RoundVolume(k * volumeMin + nextVolume);
 
       if(totalVolume <= 0)
          return;
 
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
       Print("========================================");
       Print("MAX INVENTORY EXCEEDED! Enforcing limit (NETTING)");
       Print("Open positions: ", positions, " / Max: ", MaxInventory, " (excess k = ", k, ")");
       Print("Volume of next grid order: ", DoubleToString(nextVolume, 2));
-      Print("Market volume: ", DoubleToString(totalVolume, 2),
+      Print("Volume to reduce: ", DoubleToString(totalVolume, 2),
             " (= k*", DoubleToString(volumeMin, 2), " + v_next)");
-      Print("Side: ", side);
+      Print("Side of reduction: ", side);
 
-      bool ok = false;
-      if(marketType == ORDER_TYPE_SELL)
-         ok = trade.Sell(totalVolume, _Symbol, bid, 0, 0, comment);
-      else
-         ok = trade.Buy(totalVolume, _Symbol, ask, 0, 0, comment);
+      // PositionClosePartial on NETTING reduces the consolidated position
+      trade.SetTypeFillingBySymbol(_Symbol);
+      bool ok = trade.PositionClosePartial(_Symbol, totalVolume);
 
-      if(ok)
+      Print("PositionClosePartial -> result=", (ok ? "true" : "false"),
+            " retcode=", trade.ResultRetcode(),
+            " (", trade.ResultRetcodeDescription(), ")",
+            " deal=#", trade.ResultDeal(),
+            " order=#", trade.ResultOrder());
+
+      // Fallback: send raw market order if PartialClose failed (some B3 assets require it)
+      if(!ok || trade.ResultRetcode() == TRADE_RETCODE_REJECT
+             || trade.ResultRetcode() == TRADE_RETCODE_INVALID)
       {
-         Print("Market order sent. Ticket: #", trade.ResultOrder());
-         Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
+         Print("Fallback: sending direct market order tagged MaxInv");
+
+         if(marketType == ORDER_TYPE_SELL)
+            ok = trade.Sell(totalVolume, _Symbol, 0, 0, 0, comment);
+         else
+            ok = trade.Buy(totalVolume, _Symbol, 0, 0, 0, comment);
+
+         Print("Fallback -> result=", (ok ? "true" : "false"),
+               " retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ")",
+               " deal=#", trade.ResultDeal(),
+               " order=#", trade.ResultOrder());
       }
-      else
-      {
-         Print("Error sending market order: ",
-               trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
+
+      Sleep(200);  // give the server time to reflect positions
+      Print("Positions now: ", CountOpenPositions(), " / Max: ", MaxInventory);
       Print("========================================");
    }
 }
@@ -2926,8 +2939,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    string dealComment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
    if(StringFind(dealComment, "MaxInv:") == 0)
    {
-      if(DebugMode)
-         Print("Max-inventory enforcement deal (MaxInv) skipped by grid flow.");
+      Print("MaxInv deal #", dealTicket, " executed (vol=",
+            DoubleToString(dealVolume, 2), ", type=", EnumToString(dealType),
+            ") - skipped by grid flow.");
       return;
    }
 
