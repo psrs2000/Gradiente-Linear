@@ -49,6 +49,16 @@
 //v3.28: Volume do Stop = volume da próxima ordem do array (respeita J)
 //v3.28: HEDGE fecha posição mais antiga | NETTING reduz posição consolidada
 //v3.29: COOLDOWN - Pausa após stop loss com backoff exponencial (30→60→120→desativa)
+//v3.29 (revisado): ESTOQUE MÁXIMO - Trocado Stop pendente por ORDEM A MERCADO com histerese
+//                  - EstoqueMaximo é LIMITE DE VOLUME do ativo (ações, contratos),
+//                    na mesma unidade dos volumes das ordens (não é contagem de posições)
+//                  - Quando volume_atual > EstoqueMaximo: envia ordem oposta a mercado
+//                    com volume = k + v_próxima (k = volume_atual - EstoqueMaximo)
+//                  - HEDGE: fecha posições mais antigas (full ou partial) até cobrir k + v_próxima
+//                  - NETTING: única ordem a mercado oposta de k + v_próxima
+//                  - Disparada ANTES de InserirOrdensExtremas para evitar cancelamento por
+//                    self-match contra pendentes do próprio EA na B3
+//                  - Resolve rejeição por SYMBOL_TRADE_STOPS_LEVEL e garante teto absoluto
 
 
 #property copyright "Copyright 2025, Trading Expert"
@@ -186,9 +196,6 @@ datetime ultimoResetLucroPrejuizo = 0;
 datetime ultimaSincronizacao = 0;
 bool emDesconexao = false;
 datetime timestampDesconexao = 0;  // ✅ v3.23: Momento exato da desconexão
-
-// ✅ v3.28: Controle de Estoque Máximo
-ulong ticketOrdemStop = 0;  // Ticket da ordem stop ativa (0 = nenhuma)
 
 // ✅ v3.22: Controle de Break Even e Trailing Loss dinâmico
 double prejuizoDinamico = 0;          // Prejuízo dinâmico atual (começa = PrejuizoMaximo)
@@ -903,8 +910,6 @@ void CancelarTodasOrdensDoEA()
       }
    }
 
-   // ✅ v3.28: Resetar ticket da ordem stop
-   ticketOrdemStop = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1000,56 +1005,67 @@ ulong ObterPosicaoMaisAntiga()
 }
 
 //+------------------------------------------------------------------+
-//| ✅ v3.28: Cancelar ordem Stop ativa (se existir)                 |
+//| ✅ v3.29 (revisado): Obter volume total das posições do EA       |
+//| - HEDGE: soma volume de todas as posições com nosso MagicNumber   |
+//| - NETTING: volume da posição consolidada do símbolo              |
 //+------------------------------------------------------------------+
-void CancelarOrdemStop()
+double ObterVolumeTotalPosicoes()
 {
-   if(ticketOrdemStop > 0)
+   double total = 0.0;
+
+   if(isHedge)
    {
-      if(OrderSelect(ticketOrdemStop))
+      for(int i = 0; i < PositionsTotal(); i++)
       {
-         trade.OrderDelete(ticketOrdemStop);
-
-         if(ModoDebug)
-            Print("🗑️ Ordem STOP #", ticketOrdemStop, " cancelada");
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0 &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            total += PositionGetDouble(POSITION_VOLUME);
+         }
       }
-
-      ticketOrdemStop = 0;
    }
+   else
+   {
+      if(PositionSelect(_Symbol))
+         total = PositionGetDouble(POSITION_VOLUME);
+   }
+
+   return total;
 }
 
 //+------------------------------------------------------------------+
-//| ✅ v3.28: Inserir ordem Stop de proteção (Estoque Máximo)        |
-//| - Calcula ponto médio entre última executada e próxima pendente   |
-//| - Volume = volume da próxima ordem do array                      |
-//| - HEDGE: fecha posição mais antiga | NETTING: reduz consolidada  |
+//| ✅ v3.29 (revisado): Aplicar Estoque Máximo via ordem a mercado  |
+//| - EstoqueMaximo é tratado como LIMITE DE VOLUME do ativo          |
+//|   (ações, contratos), na mesma unidade dos volumes das ordens    |
+//| - Quando volume_atual > EstoqueMaximo:                            |
+//|     k = volume_atual - EstoqueMaximo  (excedente em volume real)  |
+//|     volume_a_mercado = k + v_próxima  (histerese)                 |
+//| - HEDGE: fecha posições mais antigas (full ou partial) até cobrir |
+//|   k + v_próxima                                                   |
+//| - NETTING: única ordem a mercado oposta de k + v_próxima         |
 //+------------------------------------------------------------------+
-void InserirOrdemStop(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltimaExecutada)
+void AplicarEstoqueMaximo(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltimaExecutada)
 {
    if(EstoqueMaximo <= 0)
       return;
 
-   int posicoes = ContarPosicoesAbertas();
+   double volumeAtual = ObterVolumeTotalPosicoes();
 
-   if(posicoes < EstoqueMaximo)
-   {
-      // Abaixo do limite - cancelar stop se existir
-      CancelarOrdemStop();
-      return;
-   }
+   if(volumeAtual <= EstoqueMaximo)
+      return;  // Dentro do limite - nada a fazer
 
-   // ===== IDENTIFICAR a próxima ordem pendente no array =====
-   // Se última executada foi BUY (mercado caindo): próxima pendente é a MAIOR BUY restante
-   // Se última executada foi SELL (mercado subindo): próxima pendente é a MENOR SELL restante
+   double k = volumeAtual - EstoqueMaximo;  // excedente em VOLUME real do ativo
 
-   int indiceProxima = -1;
+   // ===== IDENTIFICAR próxima ordem pendente do lado acumulador (histerese) =====
+   double volumeProxima = 0.0;
 
    if(tipoUltimaExecutada == ORDER_TYPE_BUY_LIMIT)
    {
-      // Mercado caindo - próxima BUY LIMIT é a de MAIOR preço (mais próxima do mercado)
-      // que ainda não foi executada (ticket == 0 ou ainda está no book)
+      // Acumulando comprado: próxima BUY LIMIT é a de MAIOR preço abaixo da executada
       double maiorPreco = 0;
-
+      int indiceProxima = -1;
       for(int i = 0; i < ArraySize(originalOrders); i++)
       {
          if(originalOrders[i].orderType == ORDER_TYPE_BUY_LIMIT &&
@@ -1062,12 +1078,14 @@ void InserirOrdemStop(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltimaExe
             }
          }
       }
+      if(indiceProxima >= 0)
+         volumeProxima = originalOrders[indiceProxima].volume;
    }
    else if(tipoUltimaExecutada == ORDER_TYPE_SELL_LIMIT)
    {
-      // Mercado subindo - próxima SELL LIMIT é a de MENOR preço (mais próxima do mercado)
+      // Acumulando vendido: próxima SELL LIMIT é a de MENOR preço acima da executada
       double menorPreco = DBL_MAX;
-
+      int indiceProxima = -1;
       for(int i = 0; i < ArraySize(originalOrders); i++)
       {
          if(originalOrders[i].orderType == ORDER_TYPE_SELL_LIMIT &&
@@ -1080,68 +1098,127 @@ void InserirOrdemStop(double precoUltimaExecutada, ENUM_ORDER_TYPE tipoUltimaExe
             }
          }
       }
+      if(indiceProxima >= 0)
+         volumeProxima = originalOrders[indiceProxima].volume;
    }
-
-   // Se não encontrou próxima ordem, não insere stop (acabou a grade)
-   if(indiceProxima < 0)
+   else
    {
-      Print("========================================");
-      Print("⚠️ ESTOQUE MÁXIMO: Sem mais ordens na grade!");
-      Print("Não é possível inserir ordem Stop.");
-      Print("========================================");
-      CancelarOrdemStop();
-      return;
+      return;  // tipo desconhecido
    }
 
-   // ===== CALCULAR preço do STOP (ponto médio) =====
-   double precoProxima = originalOrders[indiceProxima].originalPrice;
-   double precoStop = ArredondarPreco((precoUltimaExecutada + precoProxima) / 2.0);
-
-   // ===== CALCULAR volume do STOP = volume da próxima ordem =====
-   double volumeStop = ArredondarVolume(originalOrders[indiceProxima].volume);
-
-   // ===== DETERMINAR tipo do STOP =====
-   ENUM_ORDER_TYPE tipoStop;
-
+   // ===== DETERMINAR direção da ordem a mercado (oposta ao lado acumulador) =====
+   ENUM_ORDER_TYPE tipoMercado;
+   string lado;
    if(tipoUltimaExecutada == ORDER_TYPE_BUY_LIMIT)
    {
-      // Acumulando BUYs (comprado) → SELL STOP para reduzir
-      tipoStop = ORDER_TYPE_SELL_STOP;
+      tipoMercado = ORDER_TYPE_SELL;  // acumulando comprado -> vender
+      lado = "VENDA";
    }
    else
    {
-      // Acumulando SELLs (vendido) → BUY STOP para reduzir
-      tipoStop = ORDER_TYPE_BUY_STOP;
+      tipoMercado = ORDER_TYPE_BUY;   // acumulando vendido -> comprar
+      lado = "COMPRA";
    }
 
-   // ===== CANCELAR stop anterior se existir =====
-   CancelarOrdemStop();
-   Sleep(100);
+   string comentario = StringFormat("MaxInv:%d", EstoqueMaximo);
+   trade.SetExpertMagicNumber(MagicNumber);
 
-   // ===== CRIAR ordem STOP =====
-   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   double volTotal = ArredondarVolume(k + volumeProxima);
+   if(volTotal <= 0)
+      return;
 
-   string comentario = StringFormat("StopProtecao:%d", EstoqueMaximo);
-
-   if(trade.OrderOpen(_Symbol, tipoStop, volumeStop, 0,
-                      precoStop, 0, 0, ORDER_TIME_GTC, 0, comentario))
+   if(isHedge)
    {
-      ticketOrdemStop = trade.ResultOrder();
-
+      // ===== HEDGE: fechar posições mais antigas até cobrir k + v_próxima =====
       Print("========================================");
-      Print("🛡️ ESTOQUE MÁXIMO ATINGIDO! Stop de proteção inserido!");
-      Print("Posições abertas: ", posicoes, " / Máximo: ", EstoqueMaximo);
-      Print("Tipo: ", EnumToString(tipoStop));
-      Print("Preço: ", DoubleToString(precoStop, _Digits), " (ponto médio)");
-      Print("  Última executada: ", DoubleToString(precoUltimaExecutada, _Digits));
-      Print("  Próxima pendente: ", DoubleToString(precoProxima, _Digits));
-      Print("Volume: ", DoubleToString(volumeStop, 2), " (= próxima ordem da grade)");
-      Print("Ticket: #", ticketOrdemStop);
+      Print("🛡️ ESTOQUE MÁXIMO EXCEDIDO! Aplicando proteção (HEDGE)");
+      Print("Volume atual: ", DoubleToString(volumeAtual, 2),
+            " / Máximo: ", EstoqueMaximo,
+            " (excedente k = ", DoubleToString(k, 2), ")");
+      Print("Volume da próxima ordem da grade: ", DoubleToString(volumeProxima, 2));
+      Print("Volume total a fechar: ", DoubleToString(volTotal, 2),
+            " (= k + v_próxima)");
+      Print("Lado de fechamento: ", lado);
+
+      double fechado = 0.0;
+      int passos = 0;
+      while(fechado < volTotal && passos < 1000)
+      {
+         passos++;
+         ulong ticketAntigo = ObterPosicaoMaisAntiga();
+         if(ticketAntigo == 0)
+            break;
+         if(!PositionSelectByTicket(ticketAntigo))
+            break;
+         double volPos = PositionGetDouble(POSITION_VOLUME);
+         double restante = volTotal - fechado;
+
+         bool ok = false;
+         if(volPos <= restante + 1e-9)
+         {
+            // Fecha posição inteira
+            ok = trade.PositionClose(ticketAntigo);
+            if(ok) fechado += volPos;
+         }
+         else
+         {
+            // Fecha parcialmente apenas o restante
+            double volParcial = ArredondarVolume(restante);
+            if(volParcial <= 0) break;
+            ok = trade.PositionClosePartial(ticketAntigo, volParcial);
+            if(ok) fechado += volParcial;
+         }
+
+         if(!ok)
+         {
+            Print("❌ Erro ao fechar #", ticketAntigo, ": ",
+                  trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+            break;
+         }
+         if(ModoDebug)
+            Print("  Fechado acumulado: ", DoubleToString(fechado, 2),
+                  " / alvo: ", DoubleToString(volTotal, 2));
+         Sleep(50);
+      }
+
+      Print("Volume agora: ", DoubleToString(ObterVolumeTotalPosicoes(), 2),
+            " / Máximo: ", EstoqueMaximo);
       Print("========================================");
    }
    else
    {
-      Print("❌ Erro ao criar ordem STOP: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+      // ===== NETTING: única ordem a mercado oposta de k + v_próxima =====
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      Print("========================================");
+      Print("🛡️ ESTOQUE MÁXIMO EXCEDIDO! Aplicando proteção (NETTING)");
+      Print("Volume atual: ", DoubleToString(volumeAtual, 2),
+            " / Máximo: ", EstoqueMaximo,
+            " (excedente k = ", DoubleToString(k, 2), ")");
+      Print("Volume da próxima ordem da grade: ", DoubleToString(volumeProxima, 2));
+      Print("Volume a mercado: ", DoubleToString(volTotal, 2),
+            " (= k + v_próxima)");
+      Print("Lado: ", lado);
+
+      bool ok = false;
+      if(tipoMercado == ORDER_TYPE_SELL)
+         ok = trade.Sell(volTotal, _Symbol, bid, 0, 0, comentario);
+      else
+         ok = trade.Buy(volTotal, _Symbol, ask, 0, 0, comentario);
+
+      if(ok)
+      {
+         Print("✅ Ordem a mercado enviada. Ticket: #", trade.ResultOrder());
+         Print("Volume agora: ", DoubleToString(ObterVolumeTotalPosicoes(), 2),
+               " / Máximo: ", EstoqueMaximo);
+      }
+      else
+      {
+         Print("❌ Erro ao enviar ordem a mercado: ",
+               trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+      }
+      Print("========================================");
    }
 }
 
@@ -2600,9 +2677,10 @@ int OnInit()
    {
       Print("============================================");
       Print("🛡️ Estoque Máximo ATIVADO");
-      Print("Limite: ", EstoqueMaximo, " posições");
-      Print("Stop de proteção: ponto médio (última exec ↔ próxima pendente)");
-      Print("Modo: ", isHedge ? "HEDGE (fecha mais antiga)" : "NETTING (reduz consolidada)");
+      Print("Limite: ", EstoqueMaximo, " (volume real do ativo)");
+      Print("Proteção: ordem a mercado oposta com histerese (k + v_próxima)");
+      Print("  k = volume_atual - EstoqueMaximo (excedente em volume real)");
+      Print("Modo: ", isHedge ? "HEDGE (fecha posições mais antigas)" : "NETTING (reduz consolidada)");
       Print("============================================");
    }
 
@@ -2680,7 +2758,7 @@ int OnInit()
    {
       Print("============================================");
       Print("✅ Gradient Grid v3.28 VOLUMES inicializado!");
-      Print("✅ v3.28: Estoque máximo com Stop de proteção");
+      Print("✅ v3.29 (revisado): Estoque Máximo via ordem a mercado com histerese");
       Print("✅ v3.26: Arredondamento tick size (corrige J/K)");
       Print("✅ v3.20: Fix label L/P (update MT5)");
       Print("✅ v3.18: Verificação ativa de cancelamento");
@@ -2877,35 +2955,15 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       Print("========================================");
    }
    
-   // ===== 🛡️ v3.28: VERIFICAR SE É ORDEM STOP DE PROTEÇÃO =====
-   if(ordemTicket == ticketOrdemStop && ticketOrdemStop > 0)
+   // ===== 🛡️ v3.29 (revisado): IGNORAR deals da proteção de Estoque Máximo =====
+   // Ordens enviadas por AplicarEstoqueMaximo() têm comentário "MaxInv:<N>".
+   // Esses deals não devem gerar ordens de gain nem reentrar no fluxo da grade.
+   string dealComment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+   if(StringFind(dealComment, "MaxInv:") == 0)
    {
-      Print("========================================");
-      Print("🛡️ ORDEM STOP DE PROTEÇÃO EXECUTADA!");
-      Print("Ticket: #", ordemTicket);
-      Print("Tipo: ", EnumToString(dealType));
-      Print("Volume: ", DoubleToString(dealVolume, 2));
-
-      if(isHedge)
-      {
-         // HEDGE: Fechar a posição mais antiga para liberar capital
-         ulong ticketPosAntiga = ObterPosicaoMaisAntiga();
-         if(ticketPosAntiga > 0)
-         {
-            // A ordem stop já executou, criando uma nova posição oposta
-            // Agora precisamos fechar a posição mais antiga
-            // Na verdade, a SELL STOP já vendeu, reduzindo exposure
-            Print("Posição mais antiga no mercado: #", ticketPosAntiga);
-         }
-      }
-
-      Print("Capital liberado para próxima operação da grade");
-      Print("========================================");
-
-      // Limpar ticket - stop já foi consumido
-      ticketOrdemStop = 0;
-
-      return;  // Não processar como ordem da grade
+      if(ModoDebug)
+         Print("🛡️ Deal de proteção (MaxInv) ignorado pelo fluxo da grade.");
+      return;
    }
 
    // ===== 🔍 BUSCAR ordem no array por TICKET =====
@@ -3015,18 +3073,19 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          Print("✅ Ordem original removida do array");
    }
    
-   // ===== 🔄 ATUALIZAR as 2 extremas no MT5 =====
-   InserirOrdensExtremas();
-
-   // ===== 🛡️ v3.28: VERIFICAR ESTOQUE MÁXIMO =====
-   // Determinar tipo da ordem que foi executada para saber direção do mercado
+   // ===== 🛡️ v3.29 (revisado): APLICAR ESTOQUE MÁXIMO ANTES DAS EXTREMAS =====
+   // Importante: a ordem a mercado precisa sair SEM pendentes nossas no book,
+   // senão o broker (B3) cancela por self-match (auto-execução).
    ENUM_ORDER_TYPE tipoOrdemExecutada;
    if(dealType == DEAL_TYPE_BUY)
       tipoOrdemExecutada = ORDER_TYPE_BUY_LIMIT;
    else
       tipoOrdemExecutada = ORDER_TYPE_SELL_LIMIT;
 
-   InserirOrdemStop(precoOriginal, tipoOrdemExecutada);
+   AplicarEstoqueMaximo(precoOriginal, tipoOrdemExecutada);
+
+   // ===== 🔄 ATUALIZAR as 2 extremas no MT5 =====
+   InserirOrdensExtremas();
 
    // ===== 💾 SALVAR estado =====
    SalvarEstadoGrade();
