@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
-//|                                  Linear Gradient Grid v3.29      |
+//|                                  Linear Gradient Grid v3.30      |
 //|                                Copyright 2025-2026, Trading Expert|
-//|                  v3.29: COOLDOWN WITH BACKOFF AFTER STOP LOSS    |
+//|         v3.30: RECONCILIATION ON START + CROSSED LEVEL AT MARKET |
 //+------------------------------------------------------------------+
 
 //Changelog:
@@ -59,10 +59,22 @@
 //                 - Fired BEFORE InsertExtremeOrders to avoid B3 self-trade cancellation
 //                   against the EA's own pendings in the book
 //                 - Fixes SYMBOL_TRADE_STOPS_LEVEL rejection and guarantees a hard ceiling
+//v3.30: RECONCILIATION ON START - When loading the previous grid (Start button,
+//       InitialStatus=ACTIVE, Activate Without Creating, cooldown resume), runs the same
+//       process as the post-reconnection sync, from the last processed deal (stored in the
+//       CSV header). Fills that happened while the EA/MT5 was offline are now recognized:
+//       order removed from the array and gain created.
+//       - Without connection on load: the sync runs in OnTimer when connected
+//       - Only deals of grid orders are considered (ticket present in the array)
+//       - Gain computed from the original order price
+//v3.30: CROSSED LEVEL - If the extreme order is rejected with 10015 (invalid price) because
+//       the market already passed its price, sends the same volume at market, as B3 does
+//       with an aggressive limit order. The deal is processed as a normal grid fill. Not
+//       executed if the order of that level was already filled.
 
 
 #property copyright    "Copyright 2025-2026, Trading Expert"
-#property version      "3.29"
+#property version      "3.30"
 #property description  "Linear-gradient symmetric grid with K (distance) and J (volume) progressive multipliers."
 #property description  "Partial-grid architecture: only the two extreme orders are kept live in the book."
 #property description  "Break-even and trailing-loss protection, maximum-inventory stop protection,"
@@ -200,6 +212,10 @@ datetime lastProfitLossReset = 0;
 datetime lastSync               = 0;
 bool     inDisconnection        = false;
 datetime disconnectionTimestamp = 0;  // v3.23: Exact disconnection moment
+
+// v3.30: Time (ms) of the last grid deal already processed.
+// Written to the CSV header; it is the start of the reconciliation window.
+long lastProcessedDealMsc = 0;
 
 // v3.22: Break Even and dynamic Trailing Loss control
 double dynamicLoss         = 0;     // Current dynamic loss (starts = MaxLoss)
@@ -416,7 +432,9 @@ void SaveGridState()
    }
 
    // Header with Ticket field
-   FileWriteString(handle, "Ticket,Type,Price,Volume,Comment\n");
+   // v3.30: Header also stores the last processed deal
+   FileWriteString(handle, StringFormat("Ticket,Type,Price,Volume,Comment,LastDealMsc=%I64d\n",
+                                        lastProcessedDealMsc));
 
    // Write ALL orders from the array
    for(int i = 0; i < ArraySize(originalOrders); i++)
@@ -501,6 +519,12 @@ void LoadPreviousGrid(bool createOrdersInMT5 = true)
    // Skip header
    string header = FileReadString(handle);
 
+   // v3.30: Read last processed deal (old CSVs do not have the field)
+   lastProcessedDealMsc = 0;
+   int mscPos = StringFind(header, "LastDealMsc=");
+   if(mscPos >= 0)
+      lastProcessedDealMsc = StringToInteger(StringSubstr(header, mscPos + 12));
+
    int orderCounter = 0;
 
    // Read each line
@@ -544,6 +568,23 @@ void LoadPreviousGrid(bool createOrdersInMT5 = true)
 
    if(DebugMode)
       Print("Grid loaded: ", orderCounter, " orders");
+
+   //--- v3.30: Reconcile fills that happened while the EA was offline
+   //--- (same process as the post-reconnection sync). Without connection, the sync
+   //--- runs automatically in OnTimer as soon as the terminal connects.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) || inDisconnection)
+   {
+      if(!inDisconnection)
+      {
+         inDisconnection = true;
+         disconnectionTimestamp = TimeCurrent();
+      }
+      Print("Grid loaded without connection - reconciliation and orders will run on connect");
+      return;
+   }
+
+   if(ReconcileOnStart())
+      SaveGridState();
 
    // v3.19: Only create orders if requested
    if(createOrdersInMT5)
@@ -641,11 +682,93 @@ void CreateInitialGrid()
    if(DebugMode)
       Print("Grid created with ", ArraySize(originalOrders), " orders");
 
+   //--- v3.30: New grid - earlier deals do not belong to it
+   lastProcessedDealMsc = (long)TimeCurrent() * 1000;
+
    //--- Save CSV
    SaveGridState();
 
    //--- Insert the 2 extreme orders in MT5
    InsertExtremeOrders();
+}
+
+//+------------------------------------------------------------------+
+//| v3.30: Execute an already-crossed level at market                |
+//| Called when the extreme order is rejected with 10015 (invalid    |
+//| price). If the market already passed the level price (BUY >= Ask |
+//| or SELL <= Bid), sends the same volume at market, as B3 does     |
+//| with an aggressive limit order. The market order ticket is kept  |
+//| on the array level: the deal is processed by OnTradeTransaction  |
+//| as a normal grid fill (gain from the original price).            |
+//+------------------------------------------------------------------+
+void ExecuteCrossedLevelAtMarket(int index)
+{
+   if(index < 0 || index >= ArraySize(originalOrders))
+      return;
+
+   ENUM_ORDER_TYPE levelType = originalOrders[index].orderType;
+   double price  = RoundPrice(originalOrders[index].originalPrice);
+   double volume = RoundVolume(originalOrders[index].volume);
+   bool isBuy = (levelType == ORDER_TYPE_BUY_LIMIT);
+
+   //--- only handle rejection caused by a price already crossed by the market
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool crossed = isBuy ? (ask > 0 && price >= ask) : (bid > 0 && price <= bid);
+   if(!crossed)
+      return;
+
+   //--- safety: never re-execute a level whose order was already filled
+   ulong levelTicket = originalOrders[index].ticket;
+   if(levelTicket > 0)
+   {
+      if(OrderSelect(levelTicket))
+      {
+         Print("Crossed level @ ", DoubleToString(price, _Digits),
+               ": order #", levelTicket, " still in book - waiting for execution");
+         return;
+      }
+      if(HistoryOrderSelect(levelTicket) &&
+         HistoryOrderGetInteger(levelTicket, ORDER_STATE) == ORDER_STATE_FILLED)
+      {
+         Print("Crossed level @ ", DoubleToString(price, _Digits),
+               ": order #", levelTicket, " already filled - waiting for processing");
+         return;
+      }
+   }
+
+   Print("========================================");
+   Print("LEVEL CROSSED BY THE MARKET - executing at market");
+   Print("Level: ", isBuy ? "BUY" : "SELL", " @ ", DoubleToString(price, _Digits),
+         " | Market: Bid ", DoubleToString(bid, _Digits), " / Ask ", DoubleToString(ask, _Digits));
+   Print("Volume: ", DoubleToString(volume, 2));
+
+   string comment = StringFormat("Crossed:%s", DoubleToString(price, _Digits));
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool ok;
+   if(isBuy)
+      ok = trade.Buy(volume, _Symbol, 0, 0, 0, comment);
+   else
+      ok = trade.Sell(volume, _Symbol, 0, 0, 0, comment);
+
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(ok && trade.ResultOrder() > 0)
+   {
+      //--- the deal of this order will be processed in OnTradeTransaction as a grid fill
+      originalOrders[index].ticket = trade.ResultOrder();
+      SaveGridState();
+      Print("Market order sent. Ticket: #", trade.ResultOrder(),
+            " (retcode ", trade.ResultRetcode(), ")");
+   }
+   else
+   {
+      Print("Error executing level at market: ",
+            trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+   }
+   Print("========================================");
 }
 
 //+------------------------------------------------------------------+
@@ -806,6 +929,10 @@ void InsertExtremeOrders()
          else
          {
             Print("  Error creating SELL: ", trade.ResultRetcode());
+
+            //--- v3.30: price already crossed -> execute at market
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecuteCrossedLevelAtMarket(smallestSellIndex);
          }
       }
       // If SELL matches -> create only BUY (if it exists in array)
@@ -826,6 +953,10 @@ void InsertExtremeOrders()
          else
          {
             Print("  Error creating BUY: ", trade.ResultRetcode());
+
+            //--- v3.30: price already crossed -> execute at market
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecuteCrossedLevelAtMarket(largestBuyIndex);
          }
       }
    }
@@ -867,6 +998,10 @@ void InsertExtremeOrders()
          else
          {
             Print("  Error creating BUY: ", trade.ResultRetcode());
+
+            //--- v3.30: price already crossed -> execute at market
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecuteCrossedLevelAtMarket(largestBuyIndex);
          }
       }
 
@@ -888,9 +1023,17 @@ void InsertExtremeOrders()
          else
          {
             Print("  Error creating SELL: ", trade.ResultRetcode());
+
+            //--- v3.30: price already crossed -> execute at market
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecuteCrossedLevelAtMarket(smallestSellIndex);
          }
       }
    }
+
+   //--- v3.30: Persist the tickets of the orders just created. Otherwise, if MT5
+   //--- went down before the next save, reconciliation would not recognize their fills.
+   SaveGridState();
 
    if(DebugMode)
       Print("Update finished");
@@ -1906,53 +2049,53 @@ void ExecuteStopLossAction()
 }
 
 //+------------------------------------------------------------------+
-//| v3.23: SYNC WITH SERVER after reconnection                       |
-//| Flow: Analyze deals -> Fix array -> Save CSV -> Cancel           |
-//|       orders -> Restart with previous grid                       |
+//| v3.30: Index of a ticket in the array (no logging)               |
 //+------------------------------------------------------------------+
-void SyncWithServer()
+int GetTicketIndexInArray(ulong ticket)
 {
-   // v3.29: Do not sync during cooldown
-   if(inCooldown)
+   if(ticket == 0)
+      return -1;
+
+   for(int i = 0; i < ArraySize(originalOrders); i++)
    {
-      Print("Sync skipped - EA in cooldown");
-      return;
+      if(originalOrders[i].ticket == ticket)
+         return i;
    }
 
-   Print("========================================");
-   Print("STARTING SERVER SYNC");
-   Print("========================================");
+   return -1;
+}
 
-   // v3.23: Use disconnection timestamp as window start
-   datetime windowStart = disconnectionTimestamp;
-
-   if(windowStart == 0)
-   {
-      Print("Disconnection timestamp not set - using 1 hour ago");
-      windowStart = TimeCurrent() - 3600;
-   }
-
+//+------------------------------------------------------------------+
+//| v3.30: Reconcile the array with pending fills                    |
+//| Analysis of the post-reconnection sync (cases A, B, C, D), also  |
+//| used when starting with the previous grid.                       |
+//| - Only deals of grid orders (ticket present in the array)         |
+//| - Only deals after the last processed one (startMsc)              |
+//| - Gain computed from the original order price                     |
+//| Returns true if there were fills to process.                      |
+//+------------------------------------------------------------------+
+bool ReconcilePendingFills(long startMsc)
+{
+   datetime windowStart = (datetime)(startMsc / 1000);
    datetime now = TimeCurrent();
 
    Print("Sync window:");
    Print("   From: ", TimeToString(windowStart, TIME_DATE|TIME_SECONDS));
-   Print("   To:   ", TimeToString(now, TIME_DATE|TIME_SECONDS));
+   Print("   To: ", TimeToString(now, TIME_DATE|TIME_SECONDS));
 
-   if(!HistorySelect(windowStart, now))
+   //--- window end with margin: TimeCurrent() is the time of the last quote
+   if(!HistorySelect(windowStart, now + 3600))
    {
       Print("Error loading deals history: ", GetLastError());
-      return;
+      return false;
    }
 
-   //========== STEP 1: COLLECT DEALS OF THE PERIOD ==========
+   //========== STEP 1: COLLECT GRID DEALS NOT PROCESSED YET ==========
    double buyVolumeTotal = 0;
    double sellVolumeTotal = 0;
-   double buyExecPrice = 0;
-   double sellExecPrice = 0;
-   double buyOriginalVolume = 0;
-   double sellOriginalVolume = 0;
    int buyIndex  = -1;
    int sellIndex = -1;
+   long latestMsc = startMsc;
 
    int totalDeals = HistoryDealsTotal();
    Print("Total deals in period: ", totalDeals);
@@ -1971,61 +2114,56 @@ void SyncWithServer()
       ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
       if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
 
+      //--- already processed (by OnTradeTransaction or a previous reconciliation)
+      long dealMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+      if(dealMsc <= startMsc) continue;
+
+      //--- grid orders only: market orders (MaxInv, closings) are not in the array
+      ulong orderTicket = HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+      int index = GetTicketIndexInArray(orderTicket);
+      if(index < 0) continue;
+
       double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
       double dealPrice  = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+
+      if(dealMsc > latestMsc)
+         latestMsc = dealMsc;
 
       if(dealType == DEAL_TYPE_BUY)
       {
          buyVolumeTotal += dealVolume;
-         buyExecPrice = dealPrice;
-         Print("   BUY executed: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits));
+         buyIndex = index;
+         Print("   BUY executed: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits),
+               " (order #", orderTicket, ")");
       }
       else
       {
          sellVolumeTotal += dealVolume;
-         sellExecPrice = dealPrice;
-         Print("   SELL executed: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits));
+         sellIndex = index;
+         Print("   SELL executed: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits),
+               " (order #", orderTicket, ")");
       }
    }
 
-   // If no deals, check book integrity and exit
    if(buyVolumeTotal == 0 && sellVolumeTotal == 0)
+      return false;
+
+   //========== STEP 2: ORIGINAL DATA OF THE ORDERS IN THE ARRAY ==========
+   double buyOriginalVolume  = 0;
+   double sellOriginalVolume = 0;
+   double buyOriginalPrice   = 0;
+   double sellOriginalPrice  = 0;
+
+   if(buyIndex >= 0)
    {
-      Print("No deals to process");
-
-      // v3.27: Check if extreme orders exist in book
-      // The previous grid creation may have failed before disconnect
-      int ordersInBook = CountEAOrders();
-      Print("Checking book integrity... Orders found: ", ordersInBook);
-
-      if(ordersInBook < 2)
-      {
-         Print("Incomplete book! Recreating extreme orders...");
-         InsertExtremeOrders();
-         Print("Extreme orders verified/recreated");
-      }
-      else
-      {
-         Print("Book is intact");
-      }
-
-      disconnectionTimestamp = 0;  // v3.23: Reset for next disconnection
-      return;
+      buyOriginalVolume = originalOrders[buyIndex].volume;
+      buyOriginalPrice  = originalOrders[buyIndex].originalPrice;
    }
 
-   //========== STEP 2: FIND ORDERS IN ARRAY ==========
-   if(buyVolumeTotal > 0)
+   if(sellIndex >= 0)
    {
-      buyIndex = FindOrderByPriceAndType(buyExecPrice, ORDER_TYPE_BUY_LIMIT);
-      if(buyIndex >= 0)
-         buyOriginalVolume = originalOrders[buyIndex].volume;
-   }
-
-   if(sellVolumeTotal > 0)
-   {
-      sellIndex = FindOrderByPriceAndType(sellExecPrice, ORDER_TYPE_SELL_LIMIT);
-      if(sellIndex >= 0)
-         sellOriginalVolume = originalOrders[sellIndex].volume;
+      sellOriginalVolume = originalOrders[sellIndex].volume;
+      sellOriginalPrice  = originalOrders[sellIndex].originalPrice;
    }
 
    //========== STEP 3: IDENTIFY AND PROCESS CASE ==========
@@ -2049,8 +2187,8 @@ void SyncWithServer()
       if(buyFull && buyIndex >= 0)
       {
          // Remove BUY from array and insert gain (SELL)
-         double gainPrice = buyExecPrice + PipsToPoints(GainPips);
-         Print("   Removing BUY @ ", DoubleToString(buyExecPrice, _Digits));
+         double gainPrice = buyOriginalPrice + PipsToPoints(GainPips);
+         Print("   Removing BUY @ ", DoubleToString(buyOriginalPrice, _Digits));
          Print("   Inserting SELL gain @ ", DoubleToString(gainPrice, _Digits));
 
          originalOrders[buyIndex].volume = 0; // Mark for removal
@@ -2059,8 +2197,8 @@ void SyncWithServer()
       else if(sellFull && sellIndex >= 0)
       {
          // Remove SELL from array and insert gain (BUY)
-         double gainPrice = sellExecPrice - PipsToPoints(GainPips);
-         Print("   Removing SELL @ ", DoubleToString(sellExecPrice, _Digits));
+         double gainPrice = sellOriginalPrice - PipsToPoints(GainPips);
+         Print("   Removing SELL @ ", DoubleToString(sellOriginalPrice, _Digits));
          Print("   Inserting BUY gain @ ", DoubleToString(gainPrice, _Digits));
 
          originalOrders[sellIndex].volume = 0; // Mark for removal
@@ -2074,6 +2212,13 @@ void SyncWithServer()
       Print("CASE B: Two orders fully executed");
       Print("   Complete cycle - position flat");
       Print("   Keeping both orders in array (no change)");
+
+      //--- v3.30: Both levels become pending again. Reset their (filled)
+      //--- tickets so they are not treated as "fill waiting for processing".
+      if(buyIndex >= 0)
+         originalOrders[buyIndex].ticket = 0;
+      if(sellIndex >= 0)
+         originalOrders[sellIndex].ticket = 0;
    }
    //---------- CASE C: One order partially executed ----------
    else if((buyPartial && sellVolumeTotal == 0) || (sellPartial && buyVolumeTotal == 0))
@@ -2083,7 +2228,7 @@ void SyncWithServer()
       if(buyPartial && buyIndex >= 0)
       {
          double remainingVolume = buyOriginalVolume - buyVolumeTotal;
-         double gainPrice = buyExecPrice + PipsToPoints(GainPips);
+         double gainPrice = buyOriginalPrice + PipsToPoints(GainPips);
 
          Print("   BUY partial: ", DoubleToString(buyVolumeTotal, 2), " of ", DoubleToString(buyOriginalVolume, 2));
          Print("   Updating volume to: ", DoubleToString(remainingVolume, 2));
@@ -2095,7 +2240,7 @@ void SyncWithServer()
       else if(sellPartial && sellIndex >= 0)
       {
          double remainingVolume = sellOriginalVolume - sellVolumeTotal;
-         double gainPrice = sellExecPrice - PipsToPoints(GainPips);
+         double gainPrice = sellOriginalPrice - PipsToPoints(GainPips);
 
          Print("   SELL partial: ", DoubleToString(sellVolumeTotal, 2), " of ", DoubleToString(sellOriginalVolume, 2));
          Print("   Updating volume to: ", DoubleToString(remainingVolume, 2));
@@ -2128,7 +2273,7 @@ void SyncWithServer()
             if(sellIndex >= 0)
             {
                double newSellVolume = sellOriginalVolume - net;
-               double gainPrice = sellExecPrice - PipsToPoints(GainPips);
+               double gainPrice = sellOriginalPrice - PipsToPoints(GainPips);
 
                Print("   Keeping BUY: ", DoubleToString(buyOriginalVolume, 2));
                Print("   Fixing SELL: ", DoubleToString(sellOriginalVolume, 2), " -> ", DoubleToString(newSellVolume, 2));
@@ -2146,7 +2291,7 @@ void SyncWithServer()
             if(buyIndex >= 0)
             {
                double newBuyVolume = buyOriginalVolume - net;
-               double gainPrice = buyExecPrice + PipsToPoints(GainPips);
+               double gainPrice = buyOriginalPrice + PipsToPoints(GainPips);
 
                Print("   Keeping SELL: ", DoubleToString(sellOriginalVolume, 2));
                Print("   Fixing BUY: ", DoubleToString(buyOriginalVolume, 2), " -> ", DoubleToString(newBuyVolume, 2));
@@ -2162,15 +2307,105 @@ void SyncWithServer()
    //========== STEP 4: CLEAN UP ZERO-VOLUME ORDERS ==========
    CleanZeroVolumeOrders();
 
-   //========== STEP 5: RESET TICKETS AND COMMENTS, SAVE CSV ==========
+   lastProcessedDealMsc = latestMsc;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| v3.30: Reconciliation when starting with previous grid           |
+//| Same process as the post-reconnection sync, from the last        |
+//| processed deal stored in the CSV.                                |
+//+------------------------------------------------------------------+
+bool ReconcileOnStart()
+{
+   Print("========================================");
+   Print("RECONCILIATION ON START (previous grid)");
+
+   long startMsc = lastProcessedDealMsc;
+   if(startMsc <= 0)
+   {
+      //--- CSV written by an older version: no time of the last processed deal
+      startMsc = (long)(TimeCurrent() - 7 * 86400) * 1000;
+      Print("CSV without the last processed deal time - checking the last 7 days");
+   }
+
+   bool processed = ReconcilePendingFills(startMsc);
+
+   if(processed)
+      Print("Fills that happened while the EA was offline were processed");
+   else
+      Print("No fills pending processing");
+   Print("========================================");
+
+   return processed;
+}
+
+//+------------------------------------------------------------------+
+//| v3.23: SYNC WITH SERVER after reconnection                       |
+//| Flow: Analyze deals -> Fix array -> Save CSV -> Cancel           |
+//|       orders -> Restart with previous grid                       |
+//| v3.30: analysis in ReconcilePendingFills()                       |
+//+------------------------------------------------------------------+
+void SyncWithServer()
+{
+   // v3.29: Do not sync during cooldown
+   if(inCooldown)
+   {
+      Print("Sync skipped - EA in cooldown");
+      return;
+   }
+
+   Print("========================================");
+   Print("STARTING SERVER SYNC");
+   Print("========================================");
+
+   //--- v3.30: Window starts at the last processed deal.
+   //--- Without it, uses the disconnection timestamp (v3.23).
+   long startMsc = lastProcessedDealMsc;
+   if(startMsc <= 0)
+   {
+      datetime windowStart = disconnectionTimestamp;
+      if(windowStart == 0)
+      {
+         Print("Disconnection timestamp not set - using 1 hour ago");
+         windowStart = TimeCurrent() - 3600;
+      }
+      startMsc = (long)windowStart * 1000;
+   }
+
+   //========== STEPS 1 TO 4: ANALYZE DEALS AND FIX ARRAY ==========
+   if(!ReconcilePendingFills(startMsc))
+   {
+      Print("No deals to process");
+
+      // v3.27: Check if extreme orders exist in book
+      // The previous grid creation may have failed before disconnect
+      int ordersInBook = CountEAOrders();
+      Print("Checking book integrity... Orders found: ", ordersInBook);
+
+      if(ordersInBook < 2)
+      {
+         Print("Incomplete book! Recreating extreme orders...");
+         InsertExtremeOrders();
+         Print("Extreme orders verified/recreated");
+      }
+      else
+      {
+         Print("Book is intact");
+      }
+
+      disconnectionTimestamp = 0;  // v3.23: Reset for next disconnection
+      return;
+   }
+
+   //========== STEP 5: RESET COMMENTS, SAVE CSV ==========
+   //--- v3.30: Tickets are kept - they tell whether a level was already filled
+   //--- (avoids executing at market again a crossed level that was already filled)
    Print("-------------------------------------");
-   Print("Resetting tickets and saving CSV...");
+   Print("Saving CSV...");
 
    for(int i = 0; i < ArraySize(originalOrders); i++)
-   {
-      originalOrders[i].ticket  = 0;
       originalOrders[i].comment = "Initial Grid";
-   }
 
    SaveGridState();
 
@@ -2243,7 +2478,7 @@ void CreatePanel()
    ObjectCreate(0, "Panel_Title", OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, "Panel_Title", OBJPROP_XDISTANCE, panelX + 60);
    ObjectSetInteger(0, "Panel_Title", OBJPROP_YDISTANCE, panelY + 5);
-   ObjectSetString(0, "Panel_Title", OBJPROP_TEXT, "Gradient Grid v3.29");
+   ObjectSetString(0, "Panel_Title", OBJPROP_TEXT, "Gradient Grid v3.30");
    ObjectSetString(0, "Panel_Title", OBJPROP_FONT, "Arial Bold");
    ObjectSetInteger(0, "Panel_Title", OBJPROP_FONTSIZE, 10);
    ObjectSetInteger(0, "Panel_Title", OBJPROP_COLOR, textColor);
@@ -2764,9 +2999,10 @@ int OnInit()
    if(DebugMode)
    {
       Print("============================================");
-      Print("Linear Gradient Grid v3.29 initialized!");
+      Print("Linear Gradient Grid v3.30 initialized!");
       Print("v3.29: Cooldown with backoff after stop loss");
       Print("v3.29 (revised): Max Inventory via market order with hysteresis");
+      Print("v3.30: Reconciliation on start + crossed level executed at market");
       Print("v3.26: Tick size rounding (fixes J/K)");
       Print("v3.20: Fix P/L label (MT5 update)");
       Print("v3.18: Active cancellation verification");
@@ -2991,6 +3227,11 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    // GET ORIGINAL DATA FROM ARRAY
    double originalPrice  = originalOrders[executedOrderIndex].originalPrice;
    double originalVolume = originalOrders[executedOrderIndex].volume;
+
+   //--- v3.30: Record the last processed grid deal (goes to the CSV)
+   long dealMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+   if(dealMsc > lastProcessedDealMsc)
+      lastProcessedDealMsc = dealMsc;
 
    if(DebugMode)
    {
