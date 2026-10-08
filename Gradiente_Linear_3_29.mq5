@@ -59,6 +59,18 @@
 //                  - Disparada ANTES de InserirOrdensExtremas para evitar cancelamento por
 //                    self-match contra pendentes do próprio EA na B3
 //                  - Resolve rejeição por SYMBOL_TRADE_STOPS_LEVEL e garante teto absoluto
+//v3.29 (revisado): RECONCILIAÇÃO AO INICIAR - Ao carregar a grade anterior (botão Iniciar,
+//                  StatusInicial=ATIVO, Ativar sem Criar, retomada do cooldown), roda o mesmo
+//                  processo da sincronização pós-reconexão, a partir do último deal processado
+//                  (gravado no cabeçalho do CSV). Execuções ocorridas com o EA/MT5 fora do ar
+//                  passam a ser reconhecidas: ordem removida do array e gain criado.
+//                  - Sem conexão ao carregar: a sincronização roda no OnTimer ao conectar
+//                  - Só considera deals de ordens da grade (ticket presente no array)
+//                  - Gain calculado pelo preço original da ordem
+//v3.29 (revisado): NÍVEL CRUZADO - Se a extrema for recusada com 10015 (invalid price) porque
+//                  o mercado já passou do preço, envia o mesmo volume a mercado, como a B3 faz
+//                  com a ordem limitada agressora. O deal é processado como execução normal da
+//                  grade. Não executa se a ordem daquele nível já foi executada.
 
 
 #property copyright "Copyright 2025, Trading Expert"
@@ -196,6 +208,10 @@ datetime ultimoResetLucroPrejuizo = 0;
 datetime ultimaSincronizacao = 0;
 bool emDesconexao = false;
 datetime timestampDesconexao = 0;  // ✅ v3.23: Momento exato da desconexão
+
+// ✅ v3.29 (revisado): Horário (ms) do último deal da grade já processado.
+// Gravado no cabeçalho do CSV; é o início da janela da reconciliação.
+long ultimoDealProcessadoMsc = 0;
 
 // ✅ v3.22: Controle de Break Even e Trailing Loss dinâmico
 double prejuizoDinamico = 0;          // Prejuízo dinâmico atual (começa = PrejuizoMaximo)
@@ -409,7 +425,9 @@ void SalvarEstadoGrade()
    }
    
    // Cabeçalho com campo Ticket
-   FileWriteString(handle, "Ticket,Tipo,Preco,Volume,Comentario\n");
+   // ✅ v3.29 (revisado): Cabeçalho também guarda o último deal processado
+   FileWriteString(handle, StringFormat("Ticket,Tipo,Preco,Volume,Comentario,UltimoDealMsc=%I64d\n",
+                                        ultimoDealProcessadoMsc));
    
    // Escrever TODAS as ordens do array
    for(int i = 0; i < ArraySize(originalOrders); i++)
@@ -493,7 +511,13 @@ void CarregarGradeAnterior(bool criarOrdensNoMT5 = true)
    
    // Ignorar cabeçalho
    string cabecalho = FileReadString(handle);
-   
+
+   // ✅ v3.29 (revisado): Ler último deal processado (CSVs antigos não têm o campo)
+   ultimoDealProcessadoMsc = 0;
+   int posMsc = StringFind(cabecalho, "UltimoDealMsc=");
+   if(posMsc >= 0)
+      ultimoDealProcessadoMsc = StringToInteger(StringSubstr(cabecalho, posMsc + 14));
+
    int contadorOrdens = 0;
    
    // Ler cada linha
@@ -537,6 +561,23 @@ void CarregarGradeAnterior(bool criarOrdensNoMT5 = true)
    
    if(ModoDebug)
       Print("✅ Grade carregada: ", contadorOrdens, " ordens");
+
+   // ✅ v3.29 (revisado): Reconciliar execuções ocorridas com o EA fora do ar
+   // (mesmo processo da sincronização pós-reconexão). Sem conexão, a sincronização
+   // roda automaticamente no OnTimer assim que o terminal conectar.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) || emDesconexao)
+   {
+      if(!emDesconexao)
+      {
+         emDesconexao = true;
+         timestampDesconexao = TimeCurrent();
+      }
+      Print("⏳ Grade carregada sem conexão - reconciliação e ordens serão feitas ao conectar");
+      return;
+   }
+
+   if(ReconciliarAoIniciar())
+      SalvarEstadoGrade();
 
    // ✅ v3.19: Só cria ordens se solicitado
    if(criarOrdensNoMT5)
@@ -633,12 +674,94 @@ void CriarGradeInicialCompleta()
    
    if(ModoDebug)
       Print("✅ Grade criada com ", ArraySize(originalOrders), " ordens");
-   
+
+   // ✅ v3.29 (revisado): Grade nova - deals anteriores não pertencem a ela
+   ultimoDealProcessadoMsc = (long)TimeCurrent() * 1000;
+
    // Salvar CSV
    SalvarEstadoGrade();
    
    // Inserir as 2 extremas no MT5
    InserirOrdensExtremas();
+}
+
+//+------------------------------------------------------------------+
+//| ✅ v3.29 (revisado): Executar a mercado um nível já cruzado      |
+//| Chamada quando a extrema é recusada com 10015 (invalid price).   |
+//| Se o mercado já passou do preço do nível (BUY >= Ask ou          |
+//| SELL <= Bid), envia o mesmo volume a mercado, como a B3 faz com  |
+//| a ordem limitada agressora. O ticket da ordem a mercado fica no  |
+//| nível do array: o deal é processado pelo OnTradeTransaction como |
+//| uma execução normal da grade (gain pelo preço original).         |
+//+------------------------------------------------------------------+
+void ExecutarNivelCruzadoAMercado(int indice)
+{
+   if(indice < 0 || indice >= ArraySize(originalOrders))
+      return;
+
+   ENUM_ORDER_TYPE tipo = originalOrders[indice].orderType;
+   double preco = ArredondarPreco(originalOrders[indice].originalPrice);
+   double volume = ArredondarVolume(originalOrders[indice].volume);
+   bool ehBuy = (tipo == ORDER_TYPE_BUY_LIMIT);
+
+   // Só trata recusa por preço já cruzado pelo mercado
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool cruzado = ehBuy ? (ask > 0 && preco >= ask) : (bid > 0 && preco <= bid);
+   if(!cruzado)
+      return;
+
+   // Segurança: não executar de novo um nível cuja ordem já foi executada
+   ulong ticketNivel = originalOrders[indice].ticket;
+   if(ticketNivel > 0)
+   {
+      if(OrderSelect(ticketNivel))
+      {
+         Print("⏳ Nível cruzado @ ", DoubleToString(preco, _Digits),
+               ": ordem #", ticketNivel, " ainda no book - aguardando execução");
+         return;
+      }
+      if(HistoryOrderSelect(ticketNivel) &&
+         HistoryOrderGetInteger(ticketNivel, ORDER_STATE) == ORDER_STATE_FILLED)
+      {
+         Print("⏳ Nível cruzado @ ", DoubleToString(preco, _Digits),
+               ": ordem #", ticketNivel, " já executada - aguardando processamento");
+         return;
+      }
+   }
+
+   Print("========================================");
+   Print("⚡ NÍVEL CRUZADO PELO MERCADO - executando a mercado");
+   Print("Nível: ", ehBuy ? "BUY" : "SELL", " @ ", DoubleToString(preco, _Digits),
+         " | Mercado: Bid ", DoubleToString(bid, _Digits), " / Ask ", DoubleToString(ask, _Digits));
+   Print("Volume: ", DoubleToString(volume, 2));
+
+   string comentario = StringFormat("Cruzada:%s", DoubleToString(preco, _Digits));
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool ok;
+   if(ehBuy)
+      ok = trade.Buy(volume, _Symbol, 0, 0, 0, comentario);
+   else
+      ok = trade.Sell(volume, _Symbol, 0, 0, 0, comentario);
+
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(ok && trade.ResultOrder() > 0)
+   {
+      // O deal desta ordem será processado no OnTradeTransaction como fill da grade
+      originalOrders[indice].ticket = trade.ResultOrder();
+      SalvarEstadoGrade();
+      Print("✅ Ordem a mercado enviada. Ticket: #", trade.ResultOrder(),
+            " (retcode ", trade.ResultRetcode(), ")");
+   }
+   else
+   {
+      Print("❌ Erro ao executar nível a mercado: ",
+            trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+   }
+   Print("========================================");
 }
 
 //+------------------------------------------------------------------+
@@ -799,6 +922,10 @@ void InserirOrdensExtremas()
          else
          {
             Print("  ❌ Erro ao criar SELL: ", trade.ResultRetcode());
+
+            // ✅ v3.29 (revisado): Preço já cruzado → executar a mercado
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecutarNivelCruzadoAMercado(indiceMenorSell);
          }
       }
       // Se SELL coincide → criar só BUY (se existir no array)
@@ -819,6 +946,10 @@ void InserirOrdensExtremas()
          else
          {
             Print("  ❌ Erro ao criar BUY: ", trade.ResultRetcode());
+
+            // ✅ v3.29 (revisado): Preço já cruzado → executar a mercado
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecutarNivelCruzadoAMercado(indiceMaiorBuy);
          }
       }
    }
@@ -860,6 +991,10 @@ void InserirOrdensExtremas()
          else
          {
             Print("  ❌ Erro ao criar BUY: ", trade.ResultRetcode());
+
+            // ✅ v3.29 (revisado): Preço já cruzado → executar a mercado
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecutarNivelCruzadoAMercado(indiceMaiorBuy);
          }
       }
 
@@ -881,9 +1016,17 @@ void InserirOrdensExtremas()
          else
          {
             Print("  ❌ Erro ao criar SELL: ", trade.ResultRetcode());
+
+            // ✅ v3.29 (revisado): Preço já cruzado → executar a mercado
+            if(trade.ResultRetcode() == TRADE_RETCODE_INVALID_PRICE)
+               ExecutarNivelCruzadoAMercado(indiceMenorSell);
          }
       }
    }
+
+   // ✅ v3.29 (revisado): Gravar os tickets das ordens recém-criadas. Sem isso, se o MT5
+   // cair antes do próximo salvamento, a reconciliação não reconheceria a execução delas.
+   SalvarEstadoGrade();
 
    if(ModoDebug)
       Print("✅ Atualização concluída");
@@ -1899,53 +2042,53 @@ void ExecutarAcaoStopLoss()
 }
 
 //+------------------------------------------------------------------+
-//| ✅ v3.23: SINCRONIZAÇÃO COM SERVIDOR após reconexão              |
-//| Fluxo: Analisa deals → Conserta array → Salva CSV → Cancela      |
-//|        ordens → Reinicia com grade anterior                      |
+//| ✅ v3.29 (revisado): Índice do ticket no array (sem log)          |
 //+------------------------------------------------------------------+
-void SincronizarComServidor()
+int IndiceDoTicketNoArray(ulong ticket)
 {
-   // ✅ v3.29: Não sincronizar durante cooldown
-   if(emCooldown)
+   if(ticket == 0)
+      return -1;
+
+   for(int i = 0; i < ArraySize(originalOrders); i++)
    {
-      Print("⏸️ Sincronização ignorada - EA em cooldown");
-      return;
+      if(originalOrders[i].ticket == ticket)
+         return i;
    }
 
-   Print("========================================");
-   Print("🔄 INICIANDO SINCRONIZAÇÃO COM SERVIDOR");
-   Print("========================================");
+   return -1;
+}
 
-   // ✅ v3.23: Usar timestamp da desconexão como início da janela
-   datetime inicioJanela = timestampDesconexao;
-
-   if(inicioJanela == 0)
-   {
-      Print("⚠️ Timestamp de desconexão não definido - usando 1 hora atrás");
-      inicioJanela = TimeCurrent() - 3600;
-   }
-
+//+------------------------------------------------------------------+
+//| ✅ v3.29 (revisado): Reconciliar o array com execuções pendentes |
+//| Análise da sincronização pós-reconexão (casos A, B, C, D), usada |
+//| também ao iniciar com a grade anterior.                          |
+//| - Só deals de ordens da grade (ticket presente no array)          |
+//| - Só deals posteriores ao último já processado (inicioMsc)        |
+//| - Gain calculado pelo preço original da ordem                     |
+//| Retorna true se havia execuções a processar.                      |
+//+------------------------------------------------------------------+
+bool ReconciliarExecucoesPendentes(long inicioMsc)
+{
+   datetime inicioJanela = (datetime)(inicioMsc / 1000);
    datetime agora = TimeCurrent();
 
    Print("🕐 Janela de sincronização:");
    Print("   De: ", TimeToString(inicioJanela, TIME_DATE|TIME_SECONDS));
    Print("   Até: ", TimeToString(agora, TIME_DATE|TIME_SECONDS));
 
-   if(!HistorySelect(inicioJanela, agora))
+   // Fim da janela com folga: TimeCurrent() é a hora da última cotação
+   if(!HistorySelect(inicioJanela, agora + 3600))
    {
       Print("❌ Erro ao carregar histórico de deals: ", GetLastError());
-      return;
+      return false;
    }
 
-   // ========== PASSO 1: COLETAR DEALS DO PERÍODO ==========
+   // ========== PASSO 1: COLETAR DEALS DA GRADE AINDA NÃO PROCESSADOS ==========
    double volumeBuyTotal = 0;
    double volumeSellTotal = 0;
-   double precoBuyExec = 0;
-   double precoSellExec = 0;
-   double volumeBuyOriginal = 0;
-   double volumeSellOriginal = 0;
    int indiceBuy = -1;
    int indiceSell = -1;
+   long maiorMsc = inicioMsc;
 
    int totalDeals = HistoryDealsTotal();
    Print("📊 Total de deals no período: ", totalDeals);
@@ -1964,61 +2107,56 @@ void SincronizarComServidor()
       ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
       if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
 
+      // Já processado (pelo OnTradeTransaction ou por reconciliação anterior)
+      long dealMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+      if(dealMsc <= inicioMsc) continue;
+
+      // Só ordens da grade: ordens a mercado (MaxInv, fechamentos) não estão no array
+      ulong ordemTicket = HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+      int indice = IndiceDoTicketNoArray(ordemTicket);
+      if(indice < 0) continue;
+
       double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
       double dealPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+
+      if(dealMsc > maiorMsc)
+         maiorMsc = dealMsc;
 
       if(dealType == DEAL_TYPE_BUY)
       {
          volumeBuyTotal += dealVolume;
-         precoBuyExec = dealPrice;
-         Print("   📌 BUY executada: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits));
+         indiceBuy = indice;
+         Print("   📌 BUY executada: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits),
+               " (ordem #", ordemTicket, ")");
       }
       else
       {
          volumeSellTotal += dealVolume;
-         precoSellExec = dealPrice;
-         Print("   📌 SELL executada: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits));
+         indiceSell = indice;
+         Print("   📌 SELL executada: ", DoubleToString(dealVolume, 2), " @ ", DoubleToString(dealPrice, _Digits),
+               " (ordem #", ordemTicket, ")");
       }
    }
 
-   // Se não houve deals, verificar integridade do book e sair
    if(volumeBuyTotal == 0 && volumeSellTotal == 0)
+      return false;
+
+   // ========== PASSO 2: DADOS ORIGINAIS DAS ORDENS NO ARRAY ==========
+   double volumeBuyOriginal = 0;
+   double volumeSellOriginal = 0;
+   double precoBuyOriginal = 0;
+   double precoSellOriginal = 0;
+
+   if(indiceBuy >= 0)
    {
-      Print("ℹ️ Nenhum deal para processar");
-
-      // ✅ v3.27: Verificar se ordens extremas existem no book
-      // Pode ter falhado ao criar ordens antes da desconexão
-      int ordensNoBook = ContarOrdensDoEA();
-      Print("🔍 Verificando integridade do book... Ordens encontradas: ", ordensNoBook);
-
-      if(ordensNoBook < 2)
-      {
-         Print("⚠️ Book incompleto! Recriando ordens extremas...");
-         InserirOrdensExtremas();
-         Print("✅ Ordens extremas verificadas/recriadas");
-      }
-      else
-      {
-         Print("✅ Book íntegro");
-      }
-
-      timestampDesconexao = 0;  // ✅ v3.23: Reseta para próxima desconexão
-      return;
+      volumeBuyOriginal = originalOrders[indiceBuy].volume;
+      precoBuyOriginal = originalOrders[indiceBuy].originalPrice;
    }
 
-   // ========== PASSO 2: ENCONTRAR ORDENS NO ARRAY ==========
-   if(volumeBuyTotal > 0)
+   if(indiceSell >= 0)
    {
-      indiceBuy = EncontrarOrdemPorPrecoETipo(precoBuyExec, ORDER_TYPE_BUY_LIMIT);
-      if(indiceBuy >= 0)
-         volumeBuyOriginal = originalOrders[indiceBuy].volume;
-   }
-
-   if(volumeSellTotal > 0)
-   {
-      indiceSell = EncontrarOrdemPorPrecoETipo(precoSellExec, ORDER_TYPE_SELL_LIMIT);
-      if(indiceSell >= 0)
-         volumeSellOriginal = originalOrders[indiceSell].volume;
+      volumeSellOriginal = originalOrders[indiceSell].volume;
+      precoSellOriginal = originalOrders[indiceSell].originalPrice;
    }
 
    // ========== PASSO 3: IDENTIFICAR E PROCESSAR CASO ==========
@@ -2042,8 +2180,8 @@ void SincronizarComServidor()
       if(buyTotal && indiceBuy >= 0)
       {
          // Remover BUY do array e inserir gain (SELL)
-         double precoGain = precoBuyExec + PipsParaPontos(GainPips);
-         Print("   Removendo BUY @ ", DoubleToString(precoBuyExec, _Digits));
+         double precoGain = precoBuyOriginal + PipsParaPontos(GainPips);
+         Print("   Removendo BUY @ ", DoubleToString(precoBuyOriginal, _Digits));
          Print("   Inserindo SELL gain @ ", DoubleToString(precoGain, _Digits));
 
          originalOrders[indiceBuy].volume = 0; // Marca para remoção
@@ -2052,8 +2190,8 @@ void SincronizarComServidor()
       else if(sellTotal && indiceSell >= 0)
       {
          // Remover SELL do array e inserir gain (BUY)
-         double precoGain = precoSellExec - PipsParaPontos(GainPips);
-         Print("   Removendo SELL @ ", DoubleToString(precoSellExec, _Digits));
+         double precoGain = precoSellOriginal - PipsParaPontos(GainPips);
+         Print("   Removendo SELL @ ", DoubleToString(precoSellOriginal, _Digits));
          Print("   Inserindo BUY gain @ ", DoubleToString(precoGain, _Digits));
 
          originalOrders[indiceSell].volume = 0; // Marca para remoção
@@ -2067,6 +2205,13 @@ void SincronizarComServidor()
       Print("📋 CASO B: Duas ordens totalmente executadas");
       Print("   Ciclo completo - posição zerada");
       Print("   Mantendo ambas ordens no array (não altera nada)");
+
+      // ✅ v3.29 (revisado): Os dois níveis voltam a ser pendentes. Zerar os tickets
+      // (já executados) para não serem tratados como "execução aguardando processamento".
+      if(indiceBuy >= 0)
+         originalOrders[indiceBuy].ticket = 0;
+      if(indiceSell >= 0)
+         originalOrders[indiceSell].ticket = 0;
    }
    // ---------- CASO C: Uma ordem parcialmente executada ----------
    else if((buyParcial && volumeSellTotal == 0) || (sellParcial && volumeBuyTotal == 0))
@@ -2076,7 +2221,7 @@ void SincronizarComServidor()
       if(buyParcial && indiceBuy >= 0)
       {
          double volumeRestante = volumeBuyOriginal - volumeBuyTotal;
-         double precoGain = precoBuyExec + PipsParaPontos(GainPips);
+         double precoGain = precoBuyOriginal + PipsParaPontos(GainPips);
 
          Print("   BUY parcial: ", DoubleToString(volumeBuyTotal, 2), " de ", DoubleToString(volumeBuyOriginal, 2));
          Print("   Atualizando volume para: ", DoubleToString(volumeRestante, 2));
@@ -2088,7 +2233,7 @@ void SincronizarComServidor()
       else if(sellParcial && indiceSell >= 0)
       {
          double volumeRestante = volumeSellOriginal - volumeSellTotal;
-         double precoGain = precoSellExec - PipsParaPontos(GainPips);
+         double precoGain = precoSellOriginal - PipsParaPontos(GainPips);
 
          Print("   SELL parcial: ", DoubleToString(volumeSellTotal, 2), " de ", DoubleToString(volumeSellOriginal, 2));
          Print("   Atualizando volume para: ", DoubleToString(volumeRestante, 2));
@@ -2121,7 +2266,7 @@ void SincronizarComServidor()
             if(indiceSell >= 0)
             {
                double novoVolumeSell = volumeSellOriginal - liquido;
-               double precoGain = precoSellExec - PipsParaPontos(GainPips);
+               double precoGain = precoSellOriginal - PipsParaPontos(GainPips);
 
                Print("   Mantendo BUY: ", DoubleToString(volumeBuyOriginal, 2));
                Print("   Corrigindo SELL: ", DoubleToString(volumeSellOriginal, 2), " -> ", DoubleToString(novoVolumeSell, 2));
@@ -2139,7 +2284,7 @@ void SincronizarComServidor()
             if(indiceBuy >= 0)
             {
                double novoVolumeBuy = volumeBuyOriginal - liquido;
-               double precoGain = precoBuyExec + PipsParaPontos(GainPips);
+               double precoGain = precoBuyOriginal + PipsParaPontos(GainPips);
 
                Print("   Mantendo SELL: ", DoubleToString(volumeSellOriginal, 2));
                Print("   Corrigindo BUY: ", DoubleToString(volumeBuyOriginal, 2), " -> ", DoubleToString(novoVolumeBuy, 2));
@@ -2155,15 +2300,105 @@ void SincronizarComServidor()
    // ========== PASSO 4: LIMPAR ORDENS COM VOLUME ZERO ==========
    LimparOrdensVolumeZero();
 
-   // ========== PASSO 5: RESETAR TICKETS E COMENTÁRIOS, SALVAR CSV ==========
+   ultimoDealProcessadoMsc = maiorMsc;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ✅ v3.29 (revisado): Reconciliação ao iniciar com grade anterior |
+//| Mesmo processo da sincronização pós-reconexão, a partir do       |
+//| último deal processado gravado no CSV.                           |
+//+------------------------------------------------------------------+
+bool ReconciliarAoIniciar()
+{
+   Print("========================================");
+   Print("🔄 RECONCILIAÇÃO AO INICIAR (grade anterior)");
+
+   long inicioMsc = ultimoDealProcessadoMsc;
+   if(inicioMsc <= 0)
+   {
+      // CSV gravado por versão anterior: sem o horário do último deal processado
+      inicioMsc = (long)(TimeCurrent() - 7 * 86400) * 1000;
+      Print("⚠️ CSV sem o horário do último deal processado - verificando os últimos 7 dias");
+   }
+
+   bool processou = ReconciliarExecucoesPendentes(inicioMsc);
+
+   if(processou)
+      Print("✅ Execuções ocorridas com o EA fora do ar foram processadas");
+   else
+      Print("ℹ️ Nenhuma execução pendente de processamento");
+   Print("========================================");
+
+   return processou;
+}
+
+//+------------------------------------------------------------------+
+//| ✅ v3.23: SINCRONIZAÇÃO COM SERVIDOR após reconexão              |
+//| Fluxo: Analisa deals → Conserta array → Salva CSV → Cancela      |
+//|        ordens → Reinicia com grade anterior                      |
+//| ✅ v3.29 (revisado): análise em ReconciliarExecucoesPendentes()  |
+//+------------------------------------------------------------------+
+void SincronizarComServidor()
+{
+   // ✅ v3.29: Não sincronizar durante cooldown
+   if(emCooldown)
+   {
+      Print("⏸️ Sincronização ignorada - EA em cooldown");
+      return;
+   }
+
+   Print("========================================");
+   Print("🔄 INICIANDO SINCRONIZAÇÃO COM SERVIDOR");
+   Print("========================================");
+
+   // ✅ v3.29 (revisado): Janela começa no último deal já processado.
+   // Sem essa referência, usa o timestamp da desconexão (v3.23).
+   long inicioMsc = ultimoDealProcessadoMsc;
+   if(inicioMsc <= 0)
+   {
+      datetime inicioJanela = timestampDesconexao;
+      if(inicioJanela == 0)
+      {
+         Print("⚠️ Timestamp de desconexão não definido - usando 1 hora atrás");
+         inicioJanela = TimeCurrent() - 3600;
+      }
+      inicioMsc = (long)inicioJanela * 1000;
+   }
+
+   // ========== PASSOS 1 A 4: ANALISAR DEALS E CONSERTAR ARRAY ==========
+   if(!ReconciliarExecucoesPendentes(inicioMsc))
+   {
+      Print("ℹ️ Nenhum deal para processar");
+
+      // ✅ v3.27: Verificar se ordens extremas existem no book
+      // Pode ter falhado ao criar ordens antes da desconexão
+      int ordensNoBook = ContarOrdensDoEA();
+      Print("🔍 Verificando integridade do book... Ordens encontradas: ", ordensNoBook);
+
+      if(ordensNoBook < 2)
+      {
+         Print("⚠️ Book incompleto! Recriando ordens extremas...");
+         InserirOrdensExtremas();
+         Print("✅ Ordens extremas verificadas/recriadas");
+      }
+      else
+      {
+         Print("✅ Book íntegro");
+      }
+
+      timestampDesconexao = 0;  // ✅ v3.23: Reseta para próxima desconexão
+      return;
+   }
+
+   // ========== PASSO 5: RESETAR COMENTÁRIOS, SALVAR CSV ==========
+   // ✅ v3.29 (revisado): Tickets mantidos - indicam se um nível já foi executado
+   // (evita executar a mercado de novo um nível cruzado já executado)
    Print("─────────────────────────────────────");
-   Print("📝 Resetando tickets e salvando CSV...");
+   Print("📝 Salvando CSV...");
 
    for(int i = 0; i < ArraySize(originalOrders); i++)
-   {
-      originalOrders[i].ticket = 0;
       originalOrders[i].comment = "Grade Inicial";
-   }
 
    SalvarEstadoGrade();
 
@@ -2759,6 +2994,7 @@ int OnInit()
       Print("============================================");
       Print("✅ Gradient Grid v3.28 VOLUMES inicializado!");
       Print("✅ v3.29 (revisado): Estoque Máximo via ordem a mercado com histerese");
+      Print("✅ v3.29 (revisado): Reconciliação ao iniciar + nível cruzado executado a mercado");
       Print("✅ v3.26: Arredondamento tick size (corrige J/K)");
       Print("✅ v3.20: Fix label L/P (update MT5)");
       Print("✅ v3.18: Verificação ativa de cancelamento");
@@ -2983,7 +3219,12 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    // ✅ PEGAR DADOS ORIGINAIS DO ARRAY
    double precoOriginal = originalOrders[indiceOrdemExecutada].originalPrice;
    double volumeOriginal = originalOrders[indiceOrdemExecutada].volume;
-   
+
+   // ✅ v3.29 (revisado): Registrar o último deal da grade processado (vai para o CSV)
+   long dealMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+   if(dealMsc > ultimoDealProcessadoMsc)
+      ultimoDealProcessadoMsc = dealMsc;
+
    if(ModoDebug)
    {
       Print("✅ Ordem encontrada no array!");
